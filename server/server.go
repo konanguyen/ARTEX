@@ -1570,10 +1570,20 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if cfg.SessionHeaderKey == "" {
 		cfg.SessionHeaderKey = providerSessionHeaderKey
 	}
-	if cfg.APIKey == "" && !cfg.Ready() {
+	if cfg.APIKey == "" {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
+		active := s.llmCfg
 		s.cfgMu.Unlock()
+		// Reuse the active profile's stored credentials only for the same format
+		// and transport target: testing a variant of the configured gateway stays
+		// keyless-friendly, while other endpoints (and native Ollama) stay
+		// deliberately credential-free.
+		sameGateway := cfg.Provider() != "ollama" && cfg.Format == active.Format && cfg.BaseURL == active.BaseURL && cfg.Proxy == active.Proxy
+		if !cfg.Ready() || sameGateway {
+			s.cfgMu.Lock()
+			cfg.APIKey = active.APIKey
+			s.cfgMu.Unlock()
+		}
 	}
 	if !cfg.Ready() {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "API Key not provided"})

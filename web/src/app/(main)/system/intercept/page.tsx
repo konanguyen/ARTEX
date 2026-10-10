@@ -93,7 +93,7 @@ function JudgeSparkbars({ daily }: { daily: JudgeDayUsage[] }) {
           <div
             key={d.date}
             title={t("intercept.judge.dailyBarTooltip", { date: d.date, calls: d.calls, tokens: fmtTokens(total) })}
-            className="min-w-[2px] flex-1 rounded-sm bg-violet-500/60 hover:bg-violet-500"
+            className={`min-w-[2px] flex-1 rounded-sm ${total > 0 ? "bg-violet-500/60 hover:bg-violet-500" : "bg-muted"}`}
             style={{ height: `${h}%` }}
           />
         );
@@ -255,9 +255,9 @@ function JudgeCard() {
     load();
   }, [load]);
 
-  // 开启后(含初次加载把开关读为 true 时)拉取审批用量统计。
+  // Load past spend even while disabled so it stays visible after turning the judge off.
   React.useEffect(() => {
-    if (cfg.enabled) loadUsage();
+    loadUsage();
   }, [cfg.enabled, loadUsage]);
 
   function patch(p: Partial<JudgeConfig>) {
@@ -316,7 +316,7 @@ function JudgeCard() {
       </div>
 
       {/* 审批 Token 用量统计(全局累计,独立于各模型配置) */}
-      {cfg.enabled && usage && (
+      {usage && (cfg.enabled || usage.calls > 0) && (
         <Card>
           <CardContent className="p-4">
             <div className="mb-3 flex items-center justify-between">
