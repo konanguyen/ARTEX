@@ -436,7 +436,9 @@ export default function DashboardPage() {
       if (date < cutoff) return;
       const prev = m.get(date) ?? { inputCacheMiss: 0, output: 0, cacheRead: 0 };
       m.set(date, {
-        inputCacheMiss: prev.inputCacheMiss + (inp - cr),
+        // the uncached bar is input minus cached reads; clamp at zero so a
+        // glitchy counter cannot render a negative segment
+        inputCacheMiss: prev.inputCacheMiss + Math.max(0, inp - cr),
         output: prev.output + out,
         cacheRead: prev.cacheRead + cr,
       });
@@ -468,7 +470,7 @@ export default function DashboardPage() {
       if (tokenTab !== "all" && (profileIdByName.get(d.profile_name) ?? defaultProfileId) !== tokenTab) continue;
       const prev = m.get(d.date) ?? { inputCacheMiss: 0, output: 0, cacheRead: 0 };
       m.set(d.date, {
-        inputCacheMiss: prev.inputCacheMiss + (d.input_tokens - d.cache_read_tokens),
+        inputCacheMiss: prev.inputCacheMiss + Math.max(0, d.input_tokens - d.cache_read_tokens),
         output: prev.output + d.output_tokens,
         cacheRead: prev.cacheRead + d.cache_read_tokens,
       });
@@ -844,7 +846,7 @@ export default function DashboardPage() {
                     }
                   />
                   {/* Input includes cache reads; stack disjoint uncached input + cache + output so the bar sums to the panel total. */}
-                  <Bar dataKey="inputCacheMiss" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
+                  <Bar dataKey="inputCacheMiss" stackId="1" fill="var(--color-inputCacheMiss)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="output" stackId="1" fill="var(--color-output)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="cacheRead" stackId="1" fill="var(--color-cacheRead)" radius={[4, 4, 0, 0]} />
                 </BarChart>
