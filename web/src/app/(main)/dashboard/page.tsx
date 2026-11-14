@@ -45,7 +45,7 @@ import { useI18n } from "@/lib/i18n";
 // ── chart constants ───────────────────────────────────────────────────────────
 
 const dailyTrendConfig = {
-  input: { label: "dashboard.input", color: "hsl(217 91% 60%)" },
+  inputCacheMiss: { label: "dashboard.inputUncached", color: "hsl(217 91% 60%)" },
   output: { label: "dashboard.output", color: "hsl(263 70% 60%)" },
   cacheRead: { label: "dashboard.cacheRead", color: "hsl(160 60% 45%)" },
 } satisfies ChartConfig;
@@ -332,14 +332,14 @@ export default function DashboardPage() {
   // tasks whose llm_profile_id is null/undefined used the active default profile
   const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
 
-  // 数据源开关：旧版 = activity（task.tokens + 会话），新版 = llm_usage 计量账本。
+  // Data source switch: legacy = activity (task.tokens + sessions), new = llm_usage metering ledger.
   const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
-  // selected profile tab: "all" = 全部; number = specific profile id
+  // selected profile tab: "all" = everything; number = specific profile id
   const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
   // day range for the daily bar chart
   const [tokenDays, setTokenDays] = React.useState<7 | 30 | 90 | 180 | 365>(30);
 
-  // profile 名 → id，用于把 llm_usage 的 profile_name 映射到现有 profile 分栏。
+  // profile name → id, used to map llm_usage profile_name onto the existing profile tabs.
   const profileIdByName = React.useMemo(() => {
     const m = new Map<string, number>();
     for (const p of llmProfiles) m.set(p.name, Number(p.id));
@@ -348,7 +348,7 @@ export default function DashboardPage() {
 
   type Bucket = { input: number; output: number; cacheRead: number; cacheWrite: number; taskCount: number };
 
-  // 旧版：按 profile 归桶（来自 activity 的 task.tokens + 会话用量）。
+  // Legacy: bucket by profile (from activity's task.tokens + session usage).
   const tokenByProfileOld = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     const fold = (key: number | null, inp: number, out: number, cr: number, cw: number, addTask: boolean) => {
@@ -384,11 +384,11 @@ export default function DashboardPage() {
     return m;
   }, [tasks, convTokens, defaultProfileId]);
 
-  // 新版：按 profile 归桶（来自 llm_usage 全局聚合，逐次调用精确）。
+  // New: bucket by profile (from the global llm_usage aggregate, exact per call).
   const tokenByProfileNew = React.useMemo<Map<number | null, Bucket>>(() => {
     const m = new Map<number | null, Bucket>();
     for (const p of usageStats?.by_profile ?? []) {
-      // 未匹配到现有 profile（改名/删除/空名）→ 落到默认桶，仍计{t("dashboard.input")}「全部」。
+      // No matching existing profile (renamed/deleted/empty name) → fall into the default bucket, still counted under "all".
       const key = profileIdByName.get(p.profile_name) ?? defaultProfileId;
       const prev = m.get(key) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
       m.set(key, {
@@ -426,16 +426,20 @@ export default function DashboardPage() {
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
   }, [tokenTab, tokenByProfile]);
 
-  // 旧版每日：把任务/会话的总量按其创建日期归桶（近似，非真实每日消耗）。
+  // Legacy daily view: bucket task/session totals by their creation date (approximate, not true daily consumption).
   const dailyTokenDataOld = React.useMemo(() => {
     const now = new Date();
     now.setDate(now.getDate() - tokenDays);
     const cutoff = now.toISOString().slice(0, 10);
-    const m = new Map<string, { input: number; output: number; cacheRead: number }>();
+    const m = new Map<string, { inputCacheMiss: number; output: number; cacheRead: number }>();
     const fold = (date: string, inp: number, out: number, cr: number) => {
       if (date < cutoff) return;
-      const prev = m.get(date) ?? { input: 0, output: 0, cacheRead: 0 };
-      m.set(date, { input: prev.input + inp, output: prev.output + out, cacheRead: prev.cacheRead + cr });
+      const prev = m.get(date) ?? { inputCacheMiss: 0, output: 0, cacheRead: 0 };
+      m.set(date, {
+        inputCacheMiss: prev.inputCacheMiss + (inp - cr),
+        output: prev.output + out,
+        cacheRead: prev.cacheRead + cr,
+      });
     };
     for (const t of tasks) {
       if (tokenTab !== "all" && (t.llm_profile_id ?? defaultProfileId) !== tokenTab) continue;
@@ -453,18 +457,18 @@ export default function DashboardPage() {
     return [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date: date.slice(5), ...v }));
   }, [tasks, convTokens, tokenDays, tokenTab, defaultProfileId]);
 
-  // 新版每日：来自 llm_usage 的真实每日消耗（ts 是实际调用时刻）。
+  // New daily view: true daily consumption from llm_usage (ts is the actual call time).
   const dailyTokenDataNew = React.useMemo(() => {
     const now = new Date();
     now.setDate(now.getDate() - tokenDays);
     const cutoff = now.toISOString().slice(0, 10);
-    const m = new Map<string, { input: number; output: number; cacheRead: number }>();
+    const m = new Map<string, { inputCacheMiss: number; output: number; cacheRead: number }>();
     for (const d of usageStats?.daily ?? []) {
       if (d.date < cutoff) continue;
       if (tokenTab !== "all" && (profileIdByName.get(d.profile_name) ?? defaultProfileId) !== tokenTab) continue;
-      const prev = m.get(d.date) ?? { input: 0, output: 0, cacheRead: 0 };
+      const prev = m.get(d.date) ?? { inputCacheMiss: 0, output: 0, cacheRead: 0 };
       m.set(d.date, {
-        input: prev.input + d.input_tokens,
+        inputCacheMiss: prev.inputCacheMiss + (d.input_tokens - d.cache_read_tokens),
         output: prev.output + d.output_tokens,
         cacheRead: prev.cacheRead + d.cache_read_tokens,
       });
@@ -507,7 +511,7 @@ export default function DashboardPage() {
 
       {/* ── Row 1: 5 stat cards ── */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        {/* 活跃任务 */}
+        {/* Active tasks */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -526,7 +530,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* 确认发现 */}
+        {/* Confirmed findings */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -542,7 +546,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* 资产节点 */}
+        {/* Asset nodes */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -553,7 +557,7 @@ export default function DashboardPage() {
           <CardContent className="text-[10px] text-muted-foreground">{t("dashboard.sharedAcrossTasks")}</CardContent>
         </Card>
 
-        {/* 流量交互 */}
+        {/* Traffic interactions */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -573,7 +577,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* LLM 用量 */}
+        {/* LLM usage */}
         <Card className="gap-1">
           <CardHeader className="pb-0">
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -597,7 +601,7 @@ export default function DashboardPage() {
           <div className="flex items-center gap-1.5 text-xs font-semibold">
             <ZapIcon className="size-3.5 text-muted-foreground" />
             {t("dashboard.tokenConsumption")}
-            {/* 数据源开关：旧版=activity 统计（含历史任务），新版=llm_usage 计量账本（更准，仅覆盖启用后） */}
+            {/* Data source switch: legacy = activity statistics (includes historical tasks), new = llm_usage metering ledger (more accurate, covers only after it was enabled) */}
             <div className="ml-1 flex gap-0.5 rounded-md border bg-muted/30 p-0.5">
               {(
                 [
@@ -695,14 +699,15 @@ export default function DashboardPage() {
             {/* Per-type bars */}
             <div className="space-y-3">
               {(() => {
-                // input 已含缓存；拆成不重叠三段：未命中输{t("dashboard.input")} + 缓存命中 + 输{t("dashboard.output")} = 总量。
+                // Input includes cache reads; split into three disjoint segments:
+                // uncached input + cache hit + output = total.
                 const total = displayedTokens.input + displayedTokens.output;
                 return [
                   {
-                    label: `${t("dashboard.input")} (uncached)`,
+                    label: t("dashboard.inputUncached"),
 
                     value: displayedTokens.input - displayedTokens.cacheRead,
-                    barColor: dailyTrendConfig.input.color!,
+                    barColor: dailyTrendConfig.inputCacheMiss.color!,
                     text: "text-blue-400",
                   },
                   {
@@ -739,7 +744,7 @@ export default function DashboardPage() {
 
             {/* Cache hit rate */}
             {(() => {
-              // input 已含缓存 → 命中率 = 缓存命中 / 总输{t("dashboard.input")}。
+              // input includes cache reads → hit rate = cache hit / total input.
               const denominator = displayedTokens.input;
               const hitPct = denominator > 0 ? Math.round((displayedTokens.cacheRead / denominator) * 100) : 0;
               return (
@@ -759,7 +764,7 @@ export default function DashboardPage() {
           <div className="flex min-h-0 flex-col">
             <div className="mb-2 flex items-center justify-between">
               <div className="flex gap-3 text-[9px] text-muted-foreground">
-                {(["input", "output", "cacheRead"] as const).map((k) => (
+                {(["inputCacheMiss", "output", "cacheRead"] as const).map((k) => (
                   <span key={k} className="flex items-center gap-1">
                     <span
                       className="inline-block size-2 rounded-sm"
@@ -838,7 +843,8 @@ export default function DashboardPage() {
                       />
                     }
                   />
-                  <Bar dataKey="input" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
+                  {/* Input includes cache reads; stack disjoint uncached input + cache + output so the bar sums to the panel total. */}
+                  <Bar dataKey="inputCacheMiss" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="output" stackId="1" fill="var(--color-output)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="cacheRead" stackId="1" fill="var(--color-cacheRead)" radius={[4, 4, 0, 0]} />
                 </BarChart>
@@ -848,7 +854,7 @@ export default function DashboardPage() {
         </div>
       </Card>
 
-      {/* ── Row 3: {t("dashboard.activityFeed")} | 发现 ── */}
+      {/* ── Row 3: {t("dashboard.activityFeed")} | findings ── */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         {/* {t("dashboard.activityFeed")} */}
         <Card className="p-4">
@@ -912,7 +918,7 @@ export default function DashboardPage() {
           </div>
         </Card>
 
-        {/* 发现 */}
+        {/* Findings */}
         <Card className="p-4">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-semibold">
@@ -957,7 +963,7 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* ── Row 4: 任务表格 ── */}
+      {/* ── Row 4: task table ── */}
       <Card className="overflow-hidden p-0">
         <div className="flex items-center justify-between border-b px-4 py-3">
           <div className="flex items-center gap-1.5 text-xs font-semibold">
@@ -1045,7 +1051,7 @@ export default function DashboardPage() {
         </table>
       </Card>
 
-      {/* ── Row 5: {t("dashboard.assetDistribution")} | {t("dashboard.trafficStatusCodes")} | 拦截 & {t("dashboard.pendingApprovals")} ── */}
+      {/* ── Row 5: {t("dashboard.assetDistribution")} | {t("dashboard.trafficStatusCodes")} | interception & {t("dashboard.pendingApprovals")} ── */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
         {/* {t("dashboard.assetDistribution")} */}
         <Card className="p-4">
@@ -1129,7 +1135,7 @@ export default function DashboardPage() {
           )}
         </Card>
 
-        {/* 系统状态 & {t("dashboard.pendingApprovals")} */}
+        {/* System status & {t("dashboard.pendingApprovals")} */}
         <Card className="p-4">
           <SectionTitle icon={ShieldCheckIcon}>{t("dashboard.systemStatus")}</SectionTitle>
 

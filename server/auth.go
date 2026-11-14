@@ -22,17 +22,20 @@ const (
 	jwtTTL         = 7 * 24 * time.Hour
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
-	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
-	// ErrPasswordTooLong，提前挡掉好过让用户收到一句含义不明的「密码加密失败」。
+	// The lower bound matches the setup page's frontend validation — validation that
+	// lives only in the frontend is as good as none: hitting the API directly bypasses
+	// it. The upper bound is bcrypt's hard limit: past 72 bytes GenerateFromPassword
+	// returns ErrPasswordTooLong; rejecting early beats a cryptic "password encryption failed".
 	minPasswordRunes = 8
 	maxPasswordBytes = 72
 )
 
-// errDataSourceUnavailable is the unified response when password-related reads fail.
+// errDataSourceUnavailable is the uniform reply when a password-related read fails.
+// These handlers must never mistake a failed read for "not set": authInit once let an
+// unauthenticated request through on a database error, overwriting the admin password.
 const errDataSourceUnavailable = "Database is temporarily unavailable; please try again later"
 
-// validatePassword returns an empty string on success, or an English error message.
+// validatePassword returns an empty string when passing, otherwise a reason ready to show the user.
 func validatePassword(pw string) string {
 	if utf8.RuneCountInString(pw) < minPasswordRunes {
 		return fmt.Sprintf("Password must be at least %d characters", minPasswordRunes)
@@ -136,9 +139,9 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
-// 读失败必须回 503 而不是 initialized:false：前端在 initialized:false 时会把用户
-// 送到 /setup 去设置密码（login/page.tsx），把数据库故障包装成 200 等于把用户往
-// 覆盖已有密码的路上推。
+// A read failure must answer 503, not initialized:false: on initialized:false the
+// frontend ships the user to /setup to set a password (login/page.tsx); wrapping a
+// database outage in a 200 pushes the user toward overwriting the existing password.
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -183,9 +186,10 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		localizedErr(w, r, 500, "Failed to encrypt password")
 		return
 	}
-	// 用 INSERT ... ON CONFLICT DO NOTHING 而不是 upsert：上面那次 GetSetting 只是
-	// 快速失败路径，真正"仅首次可设"的保证落在主键约束上。bcrypt 要跑几十毫秒，
-	// 这期间别的请求完全可能先把密码设好，而读检查本身也可能因故障而失效。
+	// INSERT ... ON CONFLICT DO NOTHING instead of an upsert: the GetSetting above is
+	// only a fast-fail path; the real "first-set-only" guarantee rests on the primary
+	// key. bcrypt runs tens of milliseconds, another request may set the password
+	// meanwhile, and the read check itself can fail under an outage.
 	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to save: "+err.Error())

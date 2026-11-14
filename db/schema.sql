@@ -551,7 +551,11 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEF
 -- exploration that already owns goals/history.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
--- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
+-- Pause freeze for the task timeout budget: stamped when a task is paused; on
+-- admission out of the paused state deadline_at is shifted forward by the paused
+-- interval (now() - paused_at) so pause time does not consume the timeout.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
+-- Optional task name; backfills old databases. Empty string=unnamed; the frontend falls back to the description.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
@@ -1060,20 +1064,26 @@ CREATE TABLE IF NOT EXISTS intercept_pending (
     tool_input      JSONB NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending', 'allowed', 'denied', 'timeout')),
-    -- 判定理由:规则命中时为规则 message;LLM 兜底判定时为模型给的简短理由(前缀 [模型])。
+    -- Decision reason: the rule message when a rule hits; the model's short reason (with the [model] prefix) for an LLM fallback decision.
     reason          TEXT NOT NULL DEFAULT '',
     decided_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_status ON intercept_pending(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_task   ON intercept_pending(task_id, created_at DESC);
--- 补旧库:reason 列(已发版,加列要带 IF NOT EXISTS)。
+-- Backfill old databases: reason column (already released, adding a column must use IF NOT EXISTS).
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 -- Detail payloads are lazy-loaded; NULL preserves the meaning of legacy history.
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS audit JSONB;
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decision_source TEXT NOT NULL DEFAULT '';
 UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 'rule'
- WHEN reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
+ WHEN lower(reason) LIKE '[model]%' OR reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
+-- Judge decisions were stored as 'unknown' because the readers expected a capitalized
+-- prefix while the judge wrote '[model]' (and '[模型]' before the UI translation). Idempotent:
+-- once corrected no row matches the WHERE clause again.
+UPDATE intercept_pending SET decision_source='model'
+ WHERE decision_source='unknown' AND rule_id IS NULL
+   AND (lower(reason) LIKE '[model]%' OR reason LIKE '[模型]%');
 
 -- =====================================================================
 -- L. 漏洞发现持久化

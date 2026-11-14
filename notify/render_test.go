@@ -107,6 +107,8 @@ func TestAssetLineOmitsExcess(t *testing.T) {
 	if got := assetLine([]string{"a", "b"}, 3); got != "a, b" {
 		t.Fatalf("under limit should list all, got %q", got)
 	}
+	// Over the limit the total must be noted, otherwise readers cannot tell how
+	// many assets were left unlisted.
 	got := assetLine([]string{"a", "b", "c", "d", "e"}, 2)
 	if !strings.Contains(got, "5 total") {
 		t.Fatalf("should note total 5, got %q", got)
@@ -123,7 +125,7 @@ func TestSeverityAndStatusLabels(t *testing.T) {
 	if got := StatusLabel("fixed"); got != "Fixed" {
 		t.Fatalf("unknown status mapping, got %q", got)
 	}
-	// Unknown status echoes as-is.
+	// Unknown statuses are echoed as-is; no label is invented.
 	if got := StatusLabel("weird_status"); got != "weird_status" {
 		t.Fatalf("unknown status should echo as-is, got %q", got)
 	}

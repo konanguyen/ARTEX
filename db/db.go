@@ -207,9 +207,12 @@ var builtinAgents = []builtinAgent{
 		{"ProxyAddr", "Recording proxy address (driver if dual copy)", "127.0.0.1:8080", "runtime"},
 		{"WorkerName", "Worker self-identifier (optional)", "worker-1", "runtime"},
 	}, false, nil},
-	// Auto: built-in platform operations agent. Driven by chat page, uses tools to manage platform.
+	// Auto: built-in "platform operations" agent. Does not join the pentest
+	// orchestration loop; driven from the chat page, operates the platform with tools.
 	{"auto", "Auto", "assistant", "Platform operations assistant: uses tools to manage tasks (create/view/pause/hint) and assets, and can create/modify skills, custom tools, and MCP.", nil, false, nil},
-	// Pentest: built-in independent penetration test agent. Driven by chat page. Default interactive shell enabled.
+	// Pentest: built-in "solo pentest" agent. Driven from the chat page, it walks the
+	// full pentest chain alone from recon to wrap-up, planning, executing and
+	// verifying by itself. Interactive shell is on by default.
 	{"pentest", "Penetration Testing", "assistant", "Standalone pentest agent: guides the entire chain from reconnaissance -> attack surface -> exploitation -> verification -> wrapup, planning, executing, and adversarially verifying on its own.", nil, true, intp(0)},
 }
 

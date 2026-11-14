@@ -1,9 +1,9 @@
-// 渠道字段表与配置值的解析工具。
+// Channel field table and config-value parsing helpers.
 //
-// 与页面拆开是因为这一份是**数据**而不是视图：它描述每种渠道有哪些字段、
-// 各自该用什么控件，以及表单文本到配置值（JSON）的双向转换。
-// 单独放一个文件后，新增渠道只需要动这里，页面本身不必改。
-// 渠道类型的展示名与简介。放在前端是因为它只影响文案，后端不需要知道。
+// This lives apart from the page because it is **data**, not a view: it describes which fields each channel has,
+// which control each field uses, and the two-way conversion between form text and config values (JSON).
+// In its own file, adding a channel only touches this file — the page itself needs no changes.
+// Display names and blurbs for channel types. Kept in the frontend because they only affect copy; the backend does not need to know.
 export const KIND_LABEL: Record<string, string> = {
   dingtalk: "DingTalk",
   feishu: "Feishu",
@@ -22,7 +22,14 @@ export function getKindLabel(kind: string, t?: (k: string) => string): string {
   return KIND_LABEL[kind] ?? kind;
 }
 
-// 各渠道的配置字段定义。
+// Config field definitions per channel.
+//
+// A frontend field table is kept here deliberately instead of having the backend send down a schema: the backend only does
+// Validate (required/format), while the UI needs layout and control types — not the same concern.
+// The single coupling point is secret_keys — which fields render as password inputs comes from the backend,
+// because only the channel implementation knows which values are credentials (WeCom's entire Webhook is the credential,
+// whereas DingTalk's is just one secret). A missing entry here for a new channel only blanks the form;
+// it does not fail silently (hasFields below surfaces it).
 export type FieldKind = "text" | "password" | "number" | "select" | "textarea" | "switch" | "kv" | "list";
 export interface FieldDef {
   key: string;
@@ -164,7 +171,7 @@ export const emptyForm = (kind: string): ChannelForm => ({
   onStatusChange: false,
 });
 
-// parseKV 解析「每行 KEY=VALUE」的文本域。
+// parseKV parses a "KEY=VALUE per line" textarea.
 export function parseKV(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of text.split("\n")) {
@@ -175,7 +182,7 @@ export function parseKV(text: string): Record<string, string> {
   }
   return out;
 }
-// parseIDs 解析逗号/空白分隔的 id 列表。
+// parseIDs parses a comma/whitespace-separated id list.
 export function parseIDs(text: string): number[] {
   return text
     .split(/[\s,，]+/)
@@ -184,7 +191,7 @@ export function parseIDs(text: string): number[] {
     .map((s) => Number(s))
     .filter((n) => Number.isFinite(n) && n > 0);
 }
-// parseKeywords 解析行/逗号分隔的关键词列表（漏洞类型名可能含空格，所以按行或逗号切）。
+// parseKeywords parses a line/comma-separated keyword list (vulnerability type names may contain spaces, hence splitting on lines or commas).
 export function parseKeywords(text: string): string[] {
   return text
     .split(/[\n,，]+/)

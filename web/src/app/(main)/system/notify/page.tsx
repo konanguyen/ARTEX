@@ -35,10 +35,10 @@ import { ConfigField, FilterSummary } from "./_components/channel-form";
 import { DeliveryList } from "./_components/delivery-list";
 import { formatBacklog, StatTile } from "./_components/stat-tile";
 
-// 本页只负责编排：加载数据、维护表单状态、调用接口。
-// 字段定义与解析在 _components/channel-fields.ts，控件与过滤摘要在
-// _components/channel-form.tsx，投递记录在 _components/delivery-list.tsx——
-// 拆开是因为它们各自能被单独读懂，而挤在一个文件里时这个页面接近 1100 行。
+// This page only orchestrates: loading data, holding form state, calling the API.
+// Field definitions and parsing live in _components/channel-fields.ts, controls and the filter summary in
+// _components/channel-form.tsx, and the delivery log in _components/delivery-list.tsx —
+// they are split out because each stays readable on its own, whereas crammed into one file this page neared 1100 lines.
 export default function NotifyPage() {
   const { t } = useI18n();
   const [meta, setMeta] = React.useState<NotificationMeta | null>(null);
@@ -64,8 +64,8 @@ export default function NotifyPage() {
         setDigestMin(m.digest_interval_min);
       })
       .catch((e) => toast.error(t("common.operateFailed", { message: (e as Error).message })));
-    // 渠道列表加载失败要报出来：静默失败会显示成「一个渠道都没有」，
-    // 用户会以为配置丢了，比直接报错更让人慌。
+    // Channel-list load failures must be reported: failing silently would render as "no channels at all",
+    // and users would think their config was lost — scarier than a straight-up error.
     api
       .notifyChannels()
       .then(setChannels)
@@ -90,7 +90,7 @@ export default function NotifyPage() {
 
   function openEdit(ch: NotificationChannel) {
     setEditing(ch);
-    // filter 在后端是 Go 结构体，永远序列化成对象（不会是 null），所以不需要兜底。
+    // filter is a Go struct on the backend and always serializes as an object (never null), so no fallback is needed.
     const f = ch.filter;
     setForm({
       name: ch.name,
@@ -98,8 +98,8 @@ export default function NotifyPage() {
       mode: ch.mode,
       enabled: ch.enabled,
       ratePerMin: String(ch.rate_per_min),
-      // 后端回显的 config 里凭据是掩码值；原样放进表单，提交时原样送回，
-      // 后端据此保留库中原值。
+      // Credentials in the backend-echoed config are masked values; put them into the form as-is and send them back as-is on submit,
+      // which tells the backend to keep the stored values.
       config: { ...ch.config },
       minSeverity: f.min_severity ?? "",
       includeText: (f.vulnclass_include ?? []).join("\n"),
@@ -111,17 +111,16 @@ export default function NotifyPage() {
     setOpen(true);
   }
 
-  // buildConfig 把表单状态转成渠道 config。
+  // buildConfig turns form state into the channel config.
   //
-  // 唯一的规则，两类值：
-  //   - 掩码值（"__masked__..."）原样送回 → 后端解读为「这个字段没改，保留库中原值」
-  //   - 其余一律按用户输入提交，空串即「清空该字段」
+  // One rule, two kinds of values:
+  //   - masked values ("__masked__...") are sent back verbatim -> the backend reads this as "field unchanged, keep the stored value"
+  //   - everything else is submitted as user input, where an empty string means "clear this field"
   //
-  // 之所以不特殊照顾凭据字段（比如「凭据留空就跳过」），是因为那会让用户**无法清除**
-  // 一个设错的密钥——界面上没有任何操作能表达「我要把它删掉」。现在的规则下，
-  // 清空输入框就等于清空该字段，语义唯一且用户可控。
-  // 掩码值不会出现在输入框里（见 ConfigField），所以「框里有字」永远等于
-  // 「用户主动填的」。
+  // Credential fields get no special treatment (no "skip when empty") because that would make it **impossible**
+  // for a user to wipe a misconfigured secret — there would be no gesture on the UI to mean "delete this".
+  // Under the current rule, clearing the input clears the field: unambiguous semantics under direct user control.
+  // Masked values never appear in inputs (see ConfigField), so "non-empty input" always means "user typed this".
   function buildConfig(): Record<string, unknown> {
     const defs = CHANNEL_FIELDS[form.kind] ?? [];
     const out: Record<string, unknown> = {};
@@ -207,6 +206,7 @@ export default function NotifyPage() {
       const r = await api.notifyTestChannel(editing.id);
       toast.success(t("notify.toast.testSent", { latency: r.latency_ms }));
     } catch (e) {
+      // The backend relays raw errors from the channel intact; this is the only clue for debugging config, so show it verbatim.
       toast.error(t("notify.toast.testFailed", { message: (e as Error).message }), { duration: 12000 });
     } finally {
       setTesting(false);
@@ -276,8 +276,8 @@ export default function NotifyPage() {
           </p>
         </div>
         {meta && (
-          // 用 div 而不是 label：Switch 自带 aria-label，外面再套一层 label
-          // 既关联不到任何原生控件，又会让点击文字看起来应该能切换。
+          // Use div instead of label: Switch provides its own aria-label; wrapping it in a label
+          // neither associates with any native control nor allows clicking the text to toggle cleanly.
           <div className="flex shrink-0 items-center gap-2 text-sm">
             <span className="text-muted-foreground">{t("notify.masterSwitch")}</span>
             <Switch
@@ -296,6 +296,7 @@ export default function NotifyPage() {
           <StatTile label={t("notify.stat.sentToday")} value={String(meta.stats.sent_today)} />
           <StatTile label={t("notify.stat.pending")} value={String(meta.stats.pending)} />
           <StatTile label={t("notify.stat.failed")} value={String(meta.stats.failed)} tone={meta.stats.failed > 0 ? "red" : undefined} />
+          {/* Backlog age is much more useful than count: 3 pending items could be 3 seconds or 3 hours. */}
           <StatTile
             label={t("notify.stat.backlogAge")}
             value={formatBacklog(meta.stats.backlog_age_ms, t)}
@@ -381,6 +382,8 @@ export default function NotifyPage() {
                         aria-label={t("workspace.delete")}
                         onClick={(e) => {
                           e.stopPropagation();
+                          // void explicitly discards the Promise: removeChannel catches and toasts itself;
+                          // no await needed here (onClick is not async).
                           void removeChannel(ch);
                         }}
                       >
@@ -424,7 +427,7 @@ export default function NotifyPage() {
                 <Select
                   value={form.kind}
                   onValueChange={(v) => {
-                    // 换类型等于换一套凭据字段，不能把旧配置合并进来。
+                    // Changing the kind swaps the credential field set; do not merge old config in.
                     setF({ kind: v, config: {} });
                   }}
                   disabled={!!editing}

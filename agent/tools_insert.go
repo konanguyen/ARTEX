@@ -227,24 +227,30 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
-			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
-			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
-			blockRules, _ := t.as.ListAssetInterceptRules()
+			// Load all asset-gate rules before writing; unreadable rules must fail closed.
+			// Blocks combine global and task rules; allows are task-local.
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf("failed to load asset interception rules: " + err.Error()), nil
+			}
 			var allowRules []db.AssetInterceptRule
 			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
+				tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID)
+				if err != nil {
+					return actool.Errorf("failed to load task asset interception rules: " + err.Error()), nil
 				}
+				blockRules = append(blockRules, tb...)
+				allowRules = ta
 			}
 
 			for i, item := range a.Assets {
-				// 资产闸门：先拦截后允许，被拒的资产禁止插入（跳过 Upsert 及后续副作用）。
+				// Asset gate: block first, then allow. A rejected asset is not inserted
+				// (skips the Upsert and any later side effects).
 				domains, ips, urls := assetInterceptCandidates(item)
 				if d := db.EvaluateAssetGate(blockRules, allowRules, domains, ips, urls); !d.Allowed {
 					errs = append(errs, errEntry{
 						Index: i,
-						Error: fmt.Sprintf("资产 %s %s，已禁止插入", assetInputLabel(item), d.Reason),
+						Error: fmt.Sprintf("asset %s %s is blocked from insertion", assetInputLabel(item), d.Reason),
 					})
 					continue
 				}

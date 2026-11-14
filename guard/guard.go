@@ -100,7 +100,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	}
 	switch dec.Action {
 	case "deny":
-		// 观测:deny 命中不阻塞审批,直接记一条 denied（历史/任务拦截页可见）。
+		// Observation: a deny hit does not block for approval; it directly logs a denied entry (visible on the history / task interception pages).
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
 		return g.block(ev.ToolName, systemBlockMessage(dec.Message), "")
 	case "allow":
@@ -125,6 +125,16 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 
 // systemBlockMessage frames an intercept block as an ARTEX platform-governance
 // decision so the agent does not mistake it for a target-side defense.
+//
+// The bare reasons ("this tool is forbidden" / "user rejected") read exactly like a WAF/403 on
+// the target, so a pentest agent's instinct is to bypass them — rewrite the
+// command, swap the payload, re-encode, retry. That is both futile (the platform
+// blocks the class of action, not one string) and wrong (it's a policy decision,
+// not an obstacle to defeat). This prefix states plainly that the block comes
+// from platform governance — it is not the target's defense and cannot be
+// forbidden — so the agent pivots to another approach instead of evading it.
+// Audit/history rows keep the raw reason (see Interceptor.Log); only the
+// model-facing tool_result carries this framing.
 func systemBlockMessage(reason string) string {
 	return "[ARTEX Platform Governance · Non-Target Defense] This invocation was blocked by the platform. " +
 		"Reason: " + reason + ". This operation is forbidden."

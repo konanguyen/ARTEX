@@ -78,6 +78,11 @@ type Client struct {
 	pending      map[int]chan *rpcResponse
 	streamErr    chan error
 	protocol     string
+	// initialized is set once initialize succeeds. Until then the
+	// MCP-Protocol-Version header is omitted: the spec requires it on requests
+	// after initialization, and the offered version already travels in the
+	// initialize body.
+	initialized bool
 }
 
 func normalizeHeaders(headers map[string]string) (map[string]string, error) {
@@ -251,6 +256,9 @@ func (c *Client) initialize(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	c.initialized = true
+	c.mu.Unlock()
 	return c.notify(ctx, "notifications/initialized", map[string]any{})
 }
 
@@ -430,17 +438,19 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	version := c.protocol
+	c.mu.Lock()
+	sid := c.sessionID
+	initialized, version := c.initialized, c.protocol
+	c.mu.Unlock()
 	if version == "" {
 		version = protocolVersion
 	}
-	req.Header.Set("MCP-Protocol-Version", version)
+	if initialized {
+		req.Header.Set("MCP-Protocol-Version", version)
+	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
-	c.mu.Lock()
-	sid := c.sessionID
-	c.mu.Unlock()
 	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}

@@ -37,6 +37,12 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+// Judge verdicts carry a [model] prefix; older rows may use [Model] or [模型].
+function isModelReason(reason?: string) {
+  if (!reason) return false;
+  return reason.toLowerCase().startsWith("[model]") || reason.startsWith("[模型]");
+}
+
 function fmtTime(value?: string) {
   if (!value) return "—";
   return new Date(value).toLocaleString("zh-CN", {
@@ -51,7 +57,7 @@ function fmtTime(value?: string) {
 function source(row: InterceptApprovalRow) {
   if (row.decision_source) return row.decision_source;
   if (row.rule_id) return "rule";
-  return row.reason?.startsWith("[模型]") || row.reason?.startsWith("[Model]") ? "model" : "unknown";
+  return isModelReason(row.reason) ? "model" : "unknown";
 }
 
 function originLabel(row: InterceptApprovalRow, t?: (k: string, v?: Record<string, string | number>) => string) {

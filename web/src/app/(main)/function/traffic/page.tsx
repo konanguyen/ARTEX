@@ -466,7 +466,7 @@ export default function TrafficPage() {
           {t("traffic.deleteTarget")}
         </Button>
         {/* Outline rather than a second destructive button: this one ignores every
-            filter, so it must not look one mis-click away from "删除该目标". */}
+            filter, so it must not look one mis-click away from "Delete this target". */}
         <Button
           variant="outline"
           size="sm"

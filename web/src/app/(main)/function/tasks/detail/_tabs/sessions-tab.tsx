@@ -490,7 +490,7 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
-export function SessionsTab({ taskId }: { taskId: string }) {
+export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; taskPaused?: boolean }) {
   const { t } = useI18n();
   const approvalFocus = useApprovalFocus({ taskId });
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
@@ -1437,6 +1437,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   // Run duration = span from this session's first step to its last (for a live
   // session, "now" so it ticks up — the 1.5s setTick above re-renders it).
+  // While the TASK is paused nothing time-derived may advance: sessions keep
+  // state='running' in the store during a pause, so live alone would keep
+  // ticking and misrepresent the frozen budget. Freeze at the last step instead.
   const runDuration = React.useMemo(() => {
     let min = Infinity,
       max = 0;
@@ -1447,9 +1450,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       if (t > max) max = t;
     }
     if (!Number.isFinite(min) || max === 0) return null;
-    const end = active.live ? Date.now() : max;
+    const end = active.live && !taskPaused ? Date.now() : max;
     return Math.max(0, end - min);
-  }, [activity, active.live]);
+  }, [activity, active.live, taskPaused]);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);

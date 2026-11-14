@@ -41,6 +41,8 @@ const POLL_MS = 8000;
 
 type KindMeta = { labelKey: string; icon: LucideIcon; dot: string; chip: string };
 
+// The broadcast board's own display metadata, deliberately not reusing the exploration graph's copy: the graph is a topology view (node cards, edge colors),
+// the broadcast a stream view (timeline rows); the two differ in information density and color needs, so they evolve separately.
 const KIND_META: Record<string, KindMeta> = {
   begin: {
     labelKey: "explorationGraph.kind.begin",
@@ -92,8 +94,11 @@ const KIND_META: Record<string, KindMeta> = {
   },
 };
 
+// Filterable kinds. The start (fact/state=origin) is not listed separately; it is filtered together with "Fact".
 const FILTER_KINDS: ExploreKind[] = ["goal", "intent", "fact", "finding", "hint", "digest"];
 
+// State semantics for goal / intent come from the global status table (StatusBadge); the other kinds' states only
+// appear in the graph and broadcast, so they are defined here.
 const STATE_META: Record<string, Record<string, { labelKey: string; tone: Tone }>> = {
   fact: {
     origin: { labelKey: "status.node.origin", tone: "slate" },
@@ -114,7 +119,7 @@ const STATE_META: Record<string, Record<string, { labelKey: string; tone: Tone }
   },
 };
 
-// 任务根是 state=origin 的 fact,播报里读作「起点」。
+// The task root is a fact with state=origin, shown as "Start" in the broadcast.
 function viewKind(n: TaskNode): string {
   return n.type === "fact" && n.state === "origin" ? "begin" : n.type;
 }
@@ -141,14 +146,14 @@ function summaryOf(n: TaskNode): string {
         if (typeof v === "string" && v.trim()) return v;
       }
     } catch {
-      return raw; // 非 JSON payload:原样播报
+      return raw; // Non-JSON payload: broadcast as-is
     }
   }
   return raw;
 }
 
 function prettyPayload(raw?: string, t?: (k: string) => string): string {
-  if (!raw?.trim()) return t ? t("tasks.detail.broadcast.noPayload") : "（无 payload）";
+  if (!raw?.trim()) return t ? t("tasks.detail.broadcast.noPayload") : "(no payload)";
   try {
     return JSON.stringify(JSON.parse(raw), null, 2);
   } catch {
@@ -192,8 +197,8 @@ function KindChip({ kind }: { kind: string }) {
   );
 }
 
-// 节点锚定的资产:类型标签 + 可辨识文本。数据随播报页一起下发(node id → 资产),
-// 展开时直接展示,不额外请求。
+// Assets anchored to the node: kind chip + identifiable text. Data travels with the broadcast page (node id -> asset);
+// shown directly when expanded without extra requests.
 function AssetList({ assets, dense = false }: { assets: FindingAsset[]; dense?: boolean }) {
   const { t } = useI18n();
   if (assets.length === 0) return null;
@@ -204,7 +209,7 @@ function AssetList({ assets, dense = false }: { assets: FindingAsset[]; dense?: 
       </div>
       <ul className="flex flex-wrap gap-1.5">
         {assets.map((a) => {
-          // 运行时 a.type 可能是标签表未覆盖的类型,退回原始字符串。转一层类型让回退不被判成多余。
+          // At runtime, a.type might be a kind not covered by the label table, falling back to the raw string. Cast to any so the fallback isn't flagged as redundant.
           const typeLabel =
             (taskAssetTypeLabel as (t: NewAssetType) => string | undefined)(a.type as NewAssetType) || a.type;
           return (
@@ -226,8 +231,8 @@ function AssetList({ assets, dense = false }: { assets: FindingAsset[]; dense?: 
   );
 }
 
-// 悬停在上下游条目上时弹出的节点名片:类型/状态/来源/时间 + 摘要 + payload 片段 + 涉及资产。
-// 数据来自本页已经拿到的 refs,不额外发请求——播报接口已经把邻居节点整份带回来了。
+// Node card popping up on hover over an upstream/downstream item: kind/state/source/time + summary + payload snippet + affected assets.
+// Data comes from the refs already fetched for this page, with no extra requests — the broadcast endpoint brings neighbor nodes along.
 function RelatedNodeCard({ node, assets }: { node: TaskNode; assets: FindingAsset[] }) {
   const { t, locale } = useI18n();
   const kind = viewKind(node);
@@ -258,7 +263,7 @@ function RelatedNodeCard({ node, assets }: { node: TaskNode; assets: FindingAsse
   );
 }
 
-// 一条播报涉及的上下游:上游 = 指向本节点的边,下游 = 本节点指出去的边。
+// Upstream and downstream nodes involved in a broadcast item: upstream = edges pointing to this node, downstream = edges pointing out from this node.
 function RelatedList({
   title,
   rows,
@@ -338,13 +343,13 @@ function BroadcastRow({
 
   return (
     <div className={cn("relative grid grid-cols-[4.5rem_1.75rem_1fr] gap-x-2", fresh && "bg-primary/5")}>
-      {/* 时间列 */}
+      {/* Time column */}
       <div className="py-3 text-right text-xs text-muted-foreground tabular-nums">
         <div>{Number.isNaN(ts) ? "--:--:--" : clockFmt.format(ts)}</div>
         <div className="text-[11px] opacity-70">{relTime(ts, now, t)}</div>
       </div>
 
-      {/* 时间轴:竖线 + 类型圆点 */}
+      {/* Timeline: vertical rule + kind dot */}
       <div className="relative flex justify-center">
         <span className="absolute inset-y-0 w-px bg-border" />
         <span
@@ -357,7 +362,7 @@ function BroadcastRow({
         </span>
       </div>
 
-      {/* 内容列 */}
+      {/* Content column */}
       <div className="min-w-0 border-b py-3 pr-1 last:border-b-0">
         <button
           type="button"
@@ -453,8 +458,8 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   const seenRef = React.useRef<Set<string>>(new Set());
   const baselineRef = React.useRef<number | null>(null);
   const streamRef = React.useRef("");
-  // 只有「最新在前的第 1 页」才是真正的直播位；其余位置轮询只更新未读计数，
-  // 不动列表，免得翻页/展开时内容在脚下变。
+  // Only "newest-first on page 1" is the true live seat; elsewhere, polling only updates the unread count
+  // without touching the list, so contents don't shift underfoot while paging or expanding.
   const atLive = page === 1 && order === "desc";
 
   React.useEffect(() => {
@@ -463,7 +468,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
     return () => clearInterval(t);
   }, []);
 
-  // 输入防抖:打字停 300ms 才真正查询,并回到第一页。
+  // Input debounce: wait for typing to stop for 300 ms before querying, and reset to page 1.
   React.useEffect(() => {
     const t = setTimeout(() => {
       setQuery(queryInput);
@@ -474,9 +479,9 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
 
   React.useEffect(() => {
     let alive = true;
-    let rendered = false; // 本次查询是否已经把内容渲染出来过
-    // 换任务/筛选/排序 = 换了一条播报流:清掉「新」标记和未读基线。翻页不算换流,
-    // 否则回到最新时就没有未读计数可算了。
+    let rendered = false; // Whether this query has rendered content yet
+    // Changing task/filter/order = switching broadcast streams: clear "new" flags and unread baselines. Paging does not count as a switch,
+    // otherwise unread counts would be lost upon returning to the latest page.
     const stream = `${taskId}|${kinds.join(",")}|${query}|${order}`;
     if (streamRef.current !== stream) {
       streamRef.current = stream;
@@ -489,7 +494,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         .explorationNodes(taskId, { page, size, kinds, q: query, order })
         .then((r) => {
           if (!alive) return;
-          // 直播位每轮都刷新;其它位置只渲染第一次,之后轮询仅更新未读计数。
+          // The live seat refreshes every round; other positions only render on the first fetch, after which polling only updates the unread count.
           if (atLive || !rendered) {
             rendered = true;
             setItems(r.items);
@@ -511,7 +516,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           setLoaded(true);
         })
         .catch(() => {
-          // 轮询是尽力而为:保留上一次成功的播报内容,下一轮自动重试。
+          // Polling is best-effort: retain the last successful broadcast content and retry automatically on the next round.
         });
     void load();
     if (!live) {
@@ -537,8 +542,8 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
     setPending(0);
   };
 
-  // 服务端的 refs 只补「不在本页的邻居」,同页节点之间的引用要靠 items 自己兜底,
-  // 否则相邻两条播报互相引用时会退化成光秃秃的「节点 #id」。
+  // The server's refs only supplement "neighbors not on this page"; cross-references between same-page nodes rely on items themselves as fallback,
+  // otherwise adjacent broadcasts referencing each other degrade into bare "node #id".
   const nodeIndex = React.useMemo(() => {
     const idx: Record<string, TaskNode> = { ...refs };
     for (const n of items) idx[n.id] = n;
@@ -549,12 +554,12 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   const start = total === 0 ? 0 : (page - 1) * size + 1;
   const end = (page - 1) * size + items.length;
 
-  // 换任务或筛选后条数变少时,把越界的页码收回来。
+  // When items decrease after switching tasks or filters, pull out-of-range page numbers back in bounds.
   React.useEffect(() => {
     if (page > pageCount) setPage(pageCount);
   }, [page, pageCount]);
 
-  // 按天分组:播报流按日期断行,长任务翻页时还能认出「这是哪天的事」。
+  // Group by day: chunk the broadcast stream by date so users can tell what day things happened on long tasks.
   const groups: Array<{ day: string; rows: TaskNode[] }> = [];
   for (const node of items) {
     const ts = Date.parse(node.ts);
@@ -566,7 +571,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
 
   return (
     <Card className="overflow-hidden py-0">
-      {/* 工具条 */}
+      {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5">
         <div className="relative w-full sm:w-64">
           <SearchIcon className="absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -638,7 +643,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         </div>
       </div>
 
-      {/* 离开直播位时的未读提示 */}
+      {/* Unread hint shown when away from the live seat */}
       {!atLive && pending > 0 && (
         <button
           type="button"

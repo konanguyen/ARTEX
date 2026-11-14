@@ -24,7 +24,7 @@ import (
 //  2. 过滤匹配永不报错：配置畸形一律按「命中」处理(见 notify.Match)。宁可多推，
 //     不可漏推。
 
-// ErrNotificationChannelNotFound channel does not exist.
+// ErrNotificationChannelNotFound indicates the channel does not exist.
 var ErrNotificationChannelNotFound = errors.New("notification channel not found")
 
 // 投递状态。

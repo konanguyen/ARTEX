@@ -2435,7 +2435,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
     const filtered = mockInterceptHistory.filter((row) => {
       const source =
-        row.decision_source || (row.rule_id ? "rule" : row.reason?.startsWith("[模型]") ? "model" : "unknown");
+        row.decision_source || (row.rule_id ? "rule" : row.reason?.toLowerCase().startsWith("[model]") || row.reason?.startsWith("[模型]") ? "model" : "unknown");
       return (
         (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
         (!status || row.status === status) &&
