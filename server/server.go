@@ -54,6 +54,10 @@ type Server struct {
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
 
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
+	authMu         sync.Mutex     // guards the cached password hash below
+	passHash       string         // cached stored password hash (drives the derived JWT signing key)
+	passHashLoaded bool
+	passHashAt     time.Time
 	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
@@ -1040,7 +1044,7 @@ func (s *Server) Handler() http.Handler {
 // with a valid token gets the service name and version; the web UI's top bar
 // reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !s.verifyToken(extractToken(r)) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
@@ -4089,11 +4093,26 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
+// cors is same-origin by default and adds nothing for browser cross-origin
+// callers: the SPA is served by the same origin, so an open ACAO header only
+// let other sites read authenticated API responses (#20). Deployments that
+// genuinely need cross-origin browser access list their origins in
+// ARTEX_CORS_ORIGINS (comma-separated); the header is sent only for those.
 func cors(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range strings.FieldsFunc(os.Getenv("ARTEX_CORS_ORIGINS"), func(r rune) bool { return r == ',' || r == ' ' }) {
+		if o = strings.TrimSpace(o); o != "" {
+			allowed[o] = true
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return

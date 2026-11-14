@@ -776,11 +776,18 @@ func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, boo
 	if !loaded && i.db == nil {
 		return Decision{}, false
 	}
-	if !i.IsToolEnabled(toolName) {
-		return Decision{}, false
-	}
+	// rules() triggers the store load, so it surfaces the same read failures the
+	// enabled-tools load would hit. The built-in denies are a safety floor (#53):
+	// a store read error must not silently lift them, so the call fails closed
+	// and the model can retry once the store recovers.
 	rules, err := i.rules()
 	if err != nil {
+		return Decision{
+			Action:  "deny",
+			Message: "内置拦截规则读取失败，按失败安全策略阻止本次调用：" + err.Error(),
+		}, true
+	}
+	if !i.IsToolEnabled(toolName) {
 		return Decision{}, false
 	}
 	for _, r := range rules {

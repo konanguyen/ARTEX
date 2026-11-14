@@ -62,3 +62,17 @@ func TestMatchNoMatchWhenNoRulesConfigured(t *testing.T) {
 		t.Fatalf("an empty, successfully-loaded rule set must not match anything, got %+v", dec)
 	}
 }
+
+// MatchBuiltin fails closed too (this port's extension of #53): a store read
+// error must not silently lift the built-in deny floor for the planner and the
+// main agent, whose guard does not consult user rules or the judge.
+func TestMatchBuiltinFailsClosedOnStoreError(t *testing.T) {
+	i := New(closedDB(t))
+	dec, ok := i.MatchBuiltin("Bash", []byte(`{"command":"rm -rf /"}`))
+	if !ok || dec.Action != "deny" {
+		t.Fatalf("read error: ok=%v action=%q, want a fail-closed deny", ok, dec.Action)
+	}
+	if !strings.Contains(dec.Message, "失败安全") {
+		t.Fatalf("deny message does not explain the fail-safe: %q", dec.Message)
+	}
+}

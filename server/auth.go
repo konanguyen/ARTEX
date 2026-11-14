@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 
 const (
 	jwtKeyFilename = "jwt.key"
+	adminPasswordEnv = "ARTEX_ADMIN_PASSWORD"
 	authPassKey    = "auth.password_hash"
 	jwtTTL         = 7 * 24 * time.Hour
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -168,6 +171,93 @@ func signJWT(key []byte) (string, error) {
 	}).SignedString(key)
 }
 
+// signingKey derives the HS256 key that signs and verifies tokens for the given
+// stored password hash: HMAC-SHA256(jwt.key, hash). Binding the key to the hash
+// means every password change — /api/auth/change-password, reset-password.sh, or
+// any direct DB edit — invalidates all tokens issued before it, so a session
+// obtained with a leaked password dies with that password (#20). With no
+// password set the raw file key is used; production never issues a token in
+// that state (authInit stores the hash first), and DB-less tests keep working.
+func (s *Server) signingKey(hash string) []byte {
+	if hash == "" {
+		return s.jwtKey
+	}
+	m := hmac.New(sha256.New, s.jwtKey)
+	m.Write([]byte(hash))
+	return m.Sum(nil)
+}
+
+// passHashCacheTTL bounds how long token verification trusts the in-memory hash
+// before re-reading it from the DB, so a password reset done outside this
+// process (reset-password.sh) revokes old sessions within this window without a
+// restart, while steady-state requests cost at most one settings lookup per window.
+var passHashCacheTTL = 2 * time.Second
+
+// cachedPassHash returns the stored password hash, re-reading it from the DB
+// once the cache is older than passHashCacheTTL.
+func (s *Server) cachedPassHash() string {
+	s.authMu.Lock()
+	fresh := s.passHashLoaded && time.Since(s.passHashAt) < passHashCacheTTL
+	h := s.passHash
+	s.authMu.Unlock()
+	if fresh {
+		return h
+	}
+	return s.reloadPassHash()
+}
+
+func (s *Server) setPassHash(h string) {
+	s.authMu.Lock()
+	s.passHash = h
+	s.passHashLoaded = true
+	s.passHashAt = time.Now()
+	s.authMu.Unlock()
+}
+
+// reloadPassHash re-reads the hash from the DB (the password may have been
+// changed outside this process) and refreshes the cache.
+func (s *Server) reloadPassHash() string {
+	h := ""
+	if s.m != nil && s.m.pg != nil {
+		h, _, _ = s.m.pg.GetSetting(authPassKey)
+	}
+	s.setPassHash(h)
+	return h
+}
+
+// verifyToken validates tok against the key derived from the current password
+// hash. On failure it refreshes the cached hash once and retries, so an
+// out-of-process password reset takes effect without a restart.
+func (s *Server) verifyToken(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	hash := s.cachedPassHash()
+	if verifyJWT(tok, s.signingKey(hash)) {
+		return true
+	}
+	if fresh := s.reloadPassHash(); fresh != hash {
+		return verifyJWT(tok, s.signingKey(fresh))
+	}
+	return false
+}
+
+// subjectOf verifies tok and returns its subject ("" when invalid). Approver
+// labels must use the same derived-key verification as requireAuth.
+func (s *Server) subjectOf(tok string) string {
+	if tok == "" {
+		return ""
+	}
+	hash := s.cachedPassHash()
+	if s := jwtSubject(tok, s.signingKey(hash)); s != "" {
+		return s
+	}
+	if fresh := s.reloadPassHash(); fresh != hash {
+		return jwtSubject(tok, s.signingKey(fresh))
+	}
+	return ""
+}
+
 // verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
 func verifyJWT(tokenStr string, key []byte) bool {
 	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
@@ -198,7 +288,7 @@ func jwtSubject(tokenStr string, key []byte) string {
 // approver is who a human decision is recorded for: the subject of the
 // request's session token.
 func (s *Server) approver(r *http.Request) string {
-	return jwtSubject(extractToken(r), s.jwtKey)
+	return s.subjectOf(extractToken(r))
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -227,7 +317,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			localizedErr(w, r, 401, "Unauthorized")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !s.verifyToken(tok) {
 			localizedErr(w, r, 401, "Invalid or expired token")
 			return
 		}
@@ -261,6 +351,21 @@ func (s *Server) initSetupToken() {
 	}
 	if hash, _, err := s.m.pg.GetSetting(authPassKey); err == nil && hash != "" {
 		return
+	}
+	// Headless deployments can seed the first password from the environment
+	// (#20) instead of scraping the setup token from the log.
+	if pw := os.Getenv(adminPasswordEnv); pw != "" {
+		if utf8.RuneCountInString(pw) < minPasswordRunes {
+			log.Printf("[auth] %s is shorter than %d characters; ignored — use the setup token instead", adminPasswordEnv, minPasswordRunes)
+		} else if h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost); err != nil {
+			log.Printf("[auth] %s hash generation failed: %v", adminPasswordEnv, err)
+		} else if err := s.m.pg.SetSetting(authPassKey, string(h)); err != nil {
+			log.Printf("[auth] %s could not be stored: %v", adminPasswordEnv, err)
+		} else {
+			s.setPassHash(string(h))
+			log.Printf("[auth] admin password initialised from %s (username ARTEX)", adminPasswordEnv)
+			return
+		}
 	}
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
@@ -323,6 +428,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	// only a fast-fail path; the real "first-set-only" guarantee rests on the primary
 	// key. bcrypt runs tens of milliseconds, another request may set the password
 	// meanwhile, and the read check itself can fail under an outage.
+	s.setPassHash(string(hash)) // issue against the new hash; verification works immediately
 	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to save: "+err.Error())
@@ -335,7 +441,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	s.setupMu.Lock()
 	s.setupToken = ""
 	s.setupMu.Unlock()
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWT(s.signingKey(string(hash)))
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to generate token")
 		return
@@ -351,7 +457,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !s.verifyToken(extractToken(r)) {
 		localizedErr(w, r, 401, "Unauthorized")
 		return
 	}
@@ -393,7 +499,16 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		localizedErr(w, r, 500, "Failed to save: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	// The derived signing key rotates with the hash: every token issued before
+	// this change — including the caller's own — stops verifying. Issue a fresh
+	// token below so the caller's session continues.
+	s.setPassHash(string(newHash))
+	tok, err := signJWT(s.signingKey(string(newHash)))
+	if err != nil {
+		localizedErr(w, r, 500, "Failed to generate token")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
@@ -443,7 +558,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 		return
 	}
 	s.loginLimit.reset(ip)
-	tok, err := signJWT(s.jwtKey)
+	s.setPassHash(hash) // verification of the just-issued token must not miss on a stale cache
+	tok, err := signJWT(s.signingKey(string(hash)))
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to generate token")
 		return
