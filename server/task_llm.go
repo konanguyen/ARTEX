@@ -15,6 +15,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
@@ -270,6 +271,11 @@ func (r *taskLLMRuntime) maxTokens() int {
 	return cfg.MaxTokens
 }
 
+func (r *taskLLMRuntime) nativeOllama() bool {
+	cfg, ok := r.activeCfg()
+	return ok && cfg.Format == llm.Format("ollama")
+}
+
 func parseTaskID(id string) (int64, error) {
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil || n <= 0 {
@@ -302,6 +308,7 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 }
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	ctx = withNativeRole(ctx, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }
@@ -312,6 +319,7 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 // duplicated model output or tool execution (the "committed" bookkeeping the
 // streaming path needs is unnecessary here).
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	ctx = withNativeRole(ctx, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }
@@ -320,6 +328,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 	for {
 		selection, err := hooks.current(ctx)
 		if err != nil {
+			intercept.SetProviderError(ctx, err)
 			return llm.Message{}, "", llm.Usage{}, err
 		}
 		var (
@@ -391,6 +400,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 		for {
 			selection, err := hooks.current(ctx)
 			if err != nil {
+				intercept.SetProviderError(ctx, err)
 				yield(llm.StreamEvent{}, err)
 				return
 			}
@@ -689,6 +699,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
+	wk.SetNativeOllamaResolver(workerRuntime.nativeOllama)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
@@ -699,6 +710,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
+	pl.SetNativeOllamaResolver(plannerRuntime.nativeOllama)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
 	pl.SetMaxTokens(plannerRuntime.maxTokens)
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
@@ -714,6 +726,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
+	main.SetNativeOllamaResolver(mainRuntime.nativeOllama)
 	main.SetNonStreaming(mainRuntime.nonStreaming)
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)

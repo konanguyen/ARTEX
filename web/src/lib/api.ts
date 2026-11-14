@@ -54,6 +54,7 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
+  LLMModelDetail,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -61,6 +62,7 @@ import type {
   LLMRetryOverride,
   LLMRetryPolicy,
   LLMTask,
+  LLMTestResult,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -869,8 +871,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -986,9 +987,12 @@ export const api = {
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
     user_agent = "", // non-empty = override User-Agent header on test request
+    // Native Ollama uses these for num_ctx, residency and num_predict; other formats ignore them.
+    native: { context_window_k?: number; keep_alive?: string; max_tokens?: number; llm_max_concurrent?: number } = {},
   ) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
-    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
+    post<LLMTestResult>("/llm/test", {
+      ...native,
       provider,
       model,
       base_url,
@@ -1023,6 +1027,8 @@ export const api = {
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
     user_agent?: string; // non-empty = override User-Agent header on every request; "" = keep default UA
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
+    keep_alive?: string; // Ollama residency such as 30m; empty uses the backend default.
+    llm_max_concurrent?: number; // 0 inherits the global cap (Ollama: one request per endpoint).
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
@@ -1034,7 +1040,7 @@ export const api = {
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
+    post<{ ok: boolean; error?: string; models?: string[]; model_details?: LLMModelDetail[] }>("/llm/models", {
       provider,
       base_url,
       api_key,
@@ -1144,8 +1150,12 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
-    post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
+  testCustomTool: (body: {
+    key?: string;
+    kind: string;
+    exec: Record<string, unknown>;
+    params: Record<string, unknown>;
+  }) => post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
   // ---- mcp ----

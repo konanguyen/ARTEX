@@ -2,7 +2,16 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, ZapIcon } from "lucide-react";
+import {
+  CpuIcon,
+  FlaskConicalIcon,
+  HardDriveIcon,
+  KeyboardIcon,
+  RadioTowerIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  ZapIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -11,10 +20,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
-import type { Settings } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
+import type { Settings } from "@/lib/types";
 
 import { LanguageCard } from "./_components/language-card";
 import { UpdateCard } from "./_components/update-card";
@@ -43,6 +53,10 @@ export default function SystemSettingsPage() {
   const [savingWorkers, setSavingWorkers] = React.useState(false);
   const [maxConcurrent, setMaxConcurrent] = React.useState("0");
   const [savingMaxConcurrent, setSavingMaxConcurrent] = React.useState(false);
+  // Opt-in local-only LLM network policy; off by default so cloud providers keep working.
+  const [localOnly, setLocalOnly] = React.useState(false);
+  const [localCidrs, setLocalCidrs] = React.useState("");
+  const [savingLocalPolicy, setSavingLocalPolicy] = React.useState(false);
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
@@ -63,6 +77,8 @@ export default function SystemSettingsPage() {
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setMaxConcurrent(String(s.llm_max_concurrent ?? 0));
+    setLocalOnly(!!s.local_llm_only);
+    setLocalCidrs((s.local_llm_allowed_cidrs ?? []).join("\n"));
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
@@ -104,6 +120,18 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => toast.error(t("common.saveFailed", { message: (e as Error).message })))
       .finally(() => setSavingMaxConcurrent(false));
+  };
+
+  const saveLocalPolicy = (patch: Pick<Settings, "local_llm_only" | "local_llm_allowed_cidrs">, success: string) => {
+    setSavingLocalPolicy(true);
+    api
+      .setSettings(patch)
+      .then((s) => {
+        apply(s);
+        toast.success(success);
+      })
+      .catch((e) => toast.error(t("common.saveFailed", { message: (e as Error).message })))
+      .finally(() => setSavingLocalPolicy(false));
   };
 
   const savePython = () => {
@@ -302,9 +330,7 @@ export default function SystemSettingsPage() {
               <RadioTowerIcon className="size-4" />
               {t("settings.traffic.title")}
             </CardTitle>
-            <CardDescription id="traffic-capture-description">
-              {t("settings.trafficCapture.cleanDesc")}
-            </CardDescription>
+            <CardDescription id="traffic-capture-description">{t("settings.trafficCapture.cleanDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
             <Label htmlFor="traffic-capture" className="text-sm font-normal text-muted-foreground">
@@ -350,9 +376,7 @@ export default function SystemSettingsPage() {
               <RadioTowerIcon className="size-4" />
               {t("settings.proxy.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.proxy.cleanDesc")}
-            </CardDescription>
+            <CardDescription>{t("settings.proxy.cleanDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
             <Label htmlFor="global-proxy" className="text-sm font-normal text-muted-foreground">
@@ -383,14 +407,13 @@ export default function SystemSettingsPage() {
               <ShieldAlertIcon className="size-4" />
               {t("settings.constraints.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.constraints.cleanDesc")}
-            </CardDescription>
+            <CardDescription>{t("settings.constraints.cleanDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             <div className="flex items-center justify-between gap-4">
               <Label htmlFor="inject-planner" className="text-sm font-normal text-muted-foreground">
-                {t("settings.constraints.injectPlanner")}{injectPlanner ? t("state.enabled") : t("state.disabled")}
+                {t("settings.constraints.injectPlanner")}
+                {injectPlanner ? t("state.enabled") : t("state.disabled")}
               </Label>
               <Switch
                 id="inject-planner"
@@ -401,7 +424,8 @@ export default function SystemSettingsPage() {
             </div>
             <div className="flex items-center justify-between gap-4">
               <Label htmlFor="inject-worker" className="text-sm font-normal text-muted-foreground">
-                {t("settings.constraints.injectWorker")}{injectWorker ? t("state.enabled") : t("state.disabled")}
+                {t("settings.constraints.injectWorker")}
+                {injectWorker ? t("state.enabled") : t("state.disabled")}
               </Label>
               <Switch
                 id="inject-worker"
@@ -419,13 +443,12 @@ export default function SystemSettingsPage() {
               <FlaskConicalIcon className="size-4" />
               {t("settings.experimental.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.experimental.cleanDesc")}
-            </CardDescription>
+            <CardDescription>{t("settings.experimental.cleanDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
             <Label htmlFor="noa-compaction" className="text-sm font-normal text-muted-foreground">
-              {t("settings.experimental.noa")}{noaCompaction ? t("state.enabled") : t("state.disabled")}
+              {t("settings.experimental.noa")}
+              {noaCompaction ? t("state.enabled") : t("state.disabled")}
             </Label>
             <Switch
               id="noa-compaction"
@@ -442,9 +465,7 @@ export default function SystemSettingsPage() {
               <SearchIcon className="size-4" />
               {t("settings.websearch.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.websearch.cleanDesc")}
-            </CardDescription>
+            <CardDescription>{t("settings.websearch.cleanDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             <div className="flex items-center justify-between gap-4">
@@ -489,9 +510,7 @@ export default function SystemSettingsPage() {
             {webSearch && backend === "deepseek" && (
               <div className="border-border/60 bg-muted/30 flex flex-col gap-2 rounded-md border p-3">
                 <p className="text-sm font-medium">{t("settings.websearch.deepseekTitle")}</p>
-                <p className="text-muted-foreground text-xs leading-relaxed">
-                  {t("settings.websearch.cleanDesc")}
-                </p>
+                <p className="text-muted-foreground text-xs leading-relaxed">{t("settings.websearch.cleanDesc")}</p>
               </div>
             )}
 
@@ -499,14 +518,20 @@ export default function SystemSettingsPage() {
               <div className="flex flex-col gap-2">
                 <Label htmlFor="brave-key" className="text-sm font-normal text-muted-foreground">
                   Brave Search API Key
-                  {braveKeySet && <span className="ml-2 text-xs text-emerald-500">{t("settings.state.configured")}</span>}
+                  {braveKeySet && (
+                    <span className="ml-2 text-xs text-emerald-500">{t("settings.state.configured")}</span>
+                  )}
                 </Label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="brave-key"
                     type="password"
                     autoComplete="off"
-                    placeholder={braveKeySet ? t("settings.websearch.keyConfiguredPlaceholder") : t("settings.websearch.bravePlaceholder")}
+                    placeholder={
+                      braveKeySet
+                        ? t("settings.websearch.keyConfiguredPlaceholder")
+                        : t("settings.websearch.bravePlaceholder")
+                    }
                     value={braveKeyInput}
                     disabled={!loaded || savingKey}
                     onChange={(e) => setBraveKeyInput(e.target.value)}
@@ -519,14 +544,8 @@ export default function SystemSettingsPage() {
                     {t("action.save")}
                   </Button>
                 </div>
-                {braveNeedsKey && (
-                  <p className="text-xs text-amber-500">
-                    {t("settings.websearch.braveNeedsKey")}
-                  </p>
-                )}
-                <p className="text-muted-foreground text-xs">
-                  {t("settings.websearch.braveInfo")}
-                </p>
+                {braveNeedsKey && <p className="text-xs text-amber-500">{t("settings.websearch.braveNeedsKey")}</p>}
+                <p className="text-muted-foreground text-xs">{t("settings.websearch.braveInfo")}</p>
               </div>
             )}
 
@@ -534,14 +553,20 @@ export default function SystemSettingsPage() {
               <div className="flex flex-col gap-2">
                 <Label htmlFor="tavily-key" className="text-sm font-normal text-muted-foreground">
                   Tavily Search API Key
-                  {tavilyKeySet && <span className="ml-2 text-xs text-emerald-500">{t("settings.state.configured")}</span>}
+                  {tavilyKeySet && (
+                    <span className="ml-2 text-xs text-emerald-500">{t("settings.state.configured")}</span>
+                  )}
                 </Label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="tavily-key"
                     type="password"
                     autoComplete="off"
-                    placeholder={tavilyKeySet ? t("settings.websearch.keyConfiguredPlaceholder") : t("settings.websearch.tavilyPlaceholder")}
+                    placeholder={
+                      tavilyKeySet
+                        ? t("settings.websearch.keyConfiguredPlaceholder")
+                        : t("settings.websearch.tavilyPlaceholder")
+                    }
                     value={tavilyKeyInput}
                     disabled={!loaded || savingTavilyKey}
                     onChange={(e) => setTavilyKeyInput(e.target.value)}
@@ -555,9 +580,7 @@ export default function SystemSettingsPage() {
                   </Button>
                 </div>
                 {webSearch && backend === "tavily" && !tavilyKeySet && (
-                  <p className="text-xs text-amber-500">
-                    {t("settings.websearch.tavilyNeedsKey")}
-                  </p>
+                  <p className="text-xs text-amber-500">{t("settings.websearch.tavilyNeedsKey")}</p>
                 )}
                 <p className="text-muted-foreground text-xs">{t("settings.websearch.tavilyInfo")}</p>
               </div>
@@ -581,17 +604,13 @@ export default function SystemSettingsPage() {
                     {t("action.save")}
                   </Button>
                 </div>
-                <p className="text-muted-foreground text-xs">
-                  {t("settings.proxy.description")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("settings.proxy.description")}</p>
               </div>
             )}
 
             {webSearch && (
               <div className="flex items-center justify-between gap-4 border-t pt-4">
-                <p className="text-muted-foreground text-xs">
-                  {t("settings.websearch.testDescription")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("settings.websearch.testDescription")}</p>
                 <Button
                   type="button"
                   variant="outline"
@@ -612,9 +631,7 @@ export default function SystemSettingsPage() {
               <RadioTowerIcon className="size-4" />
               {t("settings.python.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.python.description")}
-            </CardDescription>
+            <CardDescription>{t("settings.python.description")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             <div className="flex items-center gap-2">
@@ -641,9 +658,7 @@ export default function SystemSettingsPage() {
               <CpuIcon className="size-4" />
               {t("settings.workers.title")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.workers.description")}
-            </CardDescription>
+            <CardDescription>{t("settings.workers.description")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             <div className="flex items-center gap-2">
@@ -669,9 +684,7 @@ export default function SystemSettingsPage() {
               <ZapIcon className="size-4" />
               {t("settings.llmMaxConcurrentTitle")}
             </CardTitle>
-            <CardDescription>
-              {t("settings.llmMaxConcurrentDesc")}
-            </CardDescription>
+            <CardDescription>{t("settings.llmMaxConcurrentDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             <div className="flex items-center gap-2">
@@ -686,6 +699,58 @@ export default function SystemSettingsPage() {
               />
               <Button onClick={saveMaxConcurrent} disabled={!loaded || savingMaxConcurrent}>
                 {savingMaxConcurrent ? t("action.saving") : t("action.save")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <HardDriveIcon className="size-4" />
+              {t("settings.localOnlyTitle")}
+            </CardTitle>
+            <CardDescription>{t("settings.localOnlyDesc")}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="local-llm-only" className="font-normal text-sm">
+                {t("settings.localOnlyToggle")}
+              </Label>
+              <Switch
+                id="local-llm-only"
+                checked={localOnly}
+                disabled={!loaded || savingLocalPolicy}
+                onCheckedChange={(v) =>
+                  saveLocalPolicy({ local_llm_only: v }, t(v ? "settings.localOnlyOn" : "settings.localOnlyOff"))
+                }
+              />
+            </div>
+            <p className="text-muted-foreground text-xs">{t("settings.localOnlyEnv")}</p>
+            <Label htmlFor="local-llm-cidrs" className="text-sm">
+              {t("settings.allowlistLabel")}
+            </Label>
+            <Textarea
+              id="local-llm-cidrs"
+              rows={3}
+              className="font-mono text-sm"
+              placeholder="192.168.1.20/32"
+              value={localCidrs}
+              disabled={!loaded || savingLocalPolicy}
+              onChange={(e) => setLocalCidrs(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">{t("settings.allowlistHelp")}</p>
+            <div>
+              <Button
+                disabled={!loaded || savingLocalPolicy}
+                onClick={() =>
+                  saveLocalPolicy(
+                    { local_llm_allowed_cidrs: localCidrs.split(/[\s,]+/).filter(Boolean) },
+                    t("settings.allowlistSaved"),
+                  )
+                }
+              >
+                {t("action.save")}
               </Button>
             </div>
           </CardContent>

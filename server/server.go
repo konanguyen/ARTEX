@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -357,8 +358,10 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.KeepAlive, cfg.MaxConcurrent = p.KeepAlive, p.MaxConcurrent
+	cfg = s.applyLLMPolicy(cfg)
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if !cfg.Ready() {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
@@ -369,8 +372,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 
 // saveLLMConfig persists the LLM config as the active "default" profile in PG.
 func (s *Server) saveLLMConfig(cfg agent.Config) error {
-	// cfg.Provider() already returns one of the three valid format strings
-	// (anthropic / openai / openai-responses), matching the DB CHECK constraint.
+	// cfg.Provider() returns a supported format matching the DB CHECK constraint.
 	format := cfg.Provider()
 	var id int64
 	// 这个 legacy 端点的请求体不含轮询/收发/输出上限参数,故把库里已存的值原样带回 —
@@ -394,6 +396,12 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				}
 				userAgent = p.UserAgent
 				retry = p.Retry
+				if cfg.KeepAlive == "" {
+					cfg.KeepAlive = p.KeepAlive
+				}
+				if cfg.MaxConcurrent == 0 {
+					cfg.MaxConcurrent = p.MaxConcurrent
+				}
 				break
 			}
 		}
@@ -404,7 +412,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
-		Retry: retry,
+		Retry: retry, KeepAlive: cfg.KeepAlive, MaxConcurrent: cfg.MaxConcurrent,
 	})
 	if err != nil {
 		return err
@@ -451,14 +459,21 @@ func maxTokensResolver(cfg agent.Config) func() int {
 	return func() int { return maxTokens }
 }
 
+func sameLLMConfig(a, b agent.Config) bool {
+	a.PolicyResolver = nil
+	b.PolicyResolver = nil
+	return reflect.DeepEqual(a, b)
+}
+
 // applyLLM (re)builds the planner/worker/main-agent from cfg and installs them on
 // the running engine as the GLOBAL active pair. Safe to call at runtime (UI configures LLM).
 func (s *Server) applyLLM(cfg agent.Config) error {
+	cfg = s.applyLLMPolicy(cfg)
 	var prov llm.Provider
 	// A persisted active profile must use the same cached provider as task chains
 	// and Agent bindings, otherwise each path owns a separate rate limiter.
 	if active, _ := s.m.pg.ActiveProfile(); active != nil {
-		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
+		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && sameLLMConfig(activeCfg, cfg) {
 			prov, _, _ = s.providerForProfile(active.ID)
 		}
 	}
@@ -473,9 +488,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		profName := s.llmProf
 		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, 0, profName)
+		prov = &originProvider{inner: bindSideProvider(prov, cfg, 0, profName), cfg: cfg, id: 0}
 		// Per-profile in-flight cap (llm_max_concurrent); no-op when unset.
-		prov = newConcurrencyProvider(prov, s.m)
+		prov = s.profileConcurrencyProvider(prov, cfg)
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
@@ -505,6 +520,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent.SetGuard(s.chatGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
+	s.chatAgent.SetNativeOllamaResolver(func() bool { return cfg.Format == llm.Format("ollama") })
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
 	s.llmProv = prov
 	s.llmCfg = cfg
@@ -535,8 +551,10 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.KeepAlive, cfg.MaxConcurrent = p.KeepAlive, p.MaxConcurrent
+	cfg = s.applyLLMPolicy(cfg)
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if !cfg.Ready() {
 		return cfg, false
 	}
 	return cfg, true
@@ -610,10 +628,10 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	// Wrap with recorder, tagged with this profile's name.
 	if p, _ := s.m.pg.ProfileByID(id); p != nil {
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, id, p.Name)
+		prov = &originProvider{inner: bindSideProvider(prov, cfg, id, p.Name), cfg: cfg, id: id}
 	}
 	// Per-profile in-flight cap (llm_max_concurrent); no-op when unset.
-	prov = newConcurrencyProvider(prov, s.m)
+	prov = s.profileConcurrencyProvider(prov, cfg)
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
@@ -649,6 +667,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca.SetGuard(s.chatGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
+	ca.SetNativeOllamaResolver(func() bool { return cfg.Format == llm.Format("ollama") })
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
 	s.profMu.Lock()
 	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
@@ -698,8 +717,8 @@ func (s *Server) Handler() http.Handler {
 
 	// 页面一键更新。走的是默认的 JWT 鉴权（auth.go 只放行 /api/auth/* 和
 	// /api/health），所以这几个改动程序自身的接口天然需要登录。
-	mux.HandleFunc("GET /api/update/check", s.updateCheck)
-	mux.HandleFunc("POST /api/update/apply", s.updateApply)
+	mux.HandleFunc("GET /api/update/check", s.guardedUpdateCheck)
+	mux.HandleFunc("POST /api/update/apply", s.guardedUpdateApply)
 	mux.HandleFunc("POST /api/update/rollback", s.updateRollback)
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
 
@@ -1436,6 +1455,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
 		UserAgent        string `json:"user_agent"`         // non-empty = override User-Agent during connection test (mirrors production)
+		ContextWindowK   int    `json:"context_window_k"`
+		KeepAlive        string `json:"keep_alive"`
+		MaxTokens        int    `json:"max_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1477,11 +1499,20 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名与自定义 UA 同理：表单未带时用已存 profile 的值兜底，再回落到 provider 默认值。
 	if stored != nil {
-		if cfg.APIKey == "" {
+		if cfg.APIKey == "" && (cfg.Provider() != "ollama" || stored.Format == "ollama") {
 			cfg.APIKey = stored.APIKey
 		}
 		if cfg.SessionHeaderKey == "" {
 			cfg.SessionHeaderKey = stored.SessionHeaderKey
+		}
+		if req.KeepAlive == "" {
+			cfg.KeepAlive = stored.KeepAlive
+		}
+		if req.ContextWindowK == 0 {
+			cfg.ContextWindowK = stored.ContextWindowK
+		}
+		if req.MaxTokens == 0 {
+			cfg.MaxTokens = stored.MaxTokens
 		}
 		if cfg.UserAgent == "" {
 			cfg.UserAgent = strings.TrimSpace(stored.UserAgent)
@@ -1497,13 +1528,24 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if cfg.SessionHeaderKey == "" {
 		cfg.SessionHeaderKey = providerSessionHeaderKey
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.Ready() {
 		s.cfgMu.Lock()
 		cfg.APIKey = s.llmCfg.APIKey
 		s.cfgMu.Unlock()
 	}
-	if cfg.APIKey == "" {
+	if !cfg.Ready() {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "API Key not provided"})
+		return
+	}
+	cfg = s.applyLLMPolicy(cfg)
+	if cfg.Provider() == "ollama" {
+		if req.ContextWindowK > 0 {
+			cfg.ContextWindowK = req.ContextWindowK
+		}
+		if req.MaxTokens > 0 {
+			cfg.MaxTokens = req.MaxTokens
+		}
+		s.testOllama(w, r, cfg)
 		return
 	}
 	// 重试参数【不】带进连接测试:测试有 30s 硬超时,把配置的重试次数/长间隔叠上去
@@ -3404,6 +3446,7 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settingsPayload() map[string]any {
+	localOnly, effectiveCIDRs := s.effectiveLLMPolicy()
 	on, backend, braveKey, tavilyKey, proxy := s.m.WebSearch()
 	pyStored, _, _ := s.m.pg.GetSetting(settingPythonInterp)
 	concOn, concLimit := s.m.ConcurrencyLimit()
@@ -3429,7 +3472,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
 		// Per-profile in-flight LLM request cap; 0 = unlimited. Each profile's
 		// provider gets its own semaphore, shared across its agents.
-		"llm_max_concurrent":       s.m.LLMMaxConcurrent(),
+		"llm_max_concurrent":                s.m.LLMMaxConcurrent(),
+		"local_llm_only":                    localOnly,
+		"local_llm_allowed_cidrs":           s.savedLLMCIDRs(),
+		"local_llm_effective_allowed_cidrs": effectiveCIDRs,
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3508,7 +3554,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
 		// LLMMaxConcurrent caps simultaneous in-flight LLM requests per profile
 		// (0 = unlimited). Changing it rebuilds providers so the new cap takes hold.
-		LLMMaxConcurrent *int `json:"llm_max_concurrent"`
+		LLMMaxConcurrent     *int      `json:"llm_max_concurrent"`
+		LocalLLMOnly         *bool     `json:"local_llm_only"`
+		LocalLLMAllowedCIDRs *[]string `json:"local_llm_allowed_cidrs"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -3643,6 +3691,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	changed := false
+	if req.LocalLLMOnly != nil || req.LocalLLMAllowedCIDRs != nil {
+		if err := s.saveLLMPolicy(req.LocalLLMOnly, req.LocalLLMAllowedCIDRs); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		s.invalidateProfileAgents()
+		changed = true
+	}
 	if req.LLMMaxConcurrent != nil {
 		if err := s.m.SetLLMMaxConcurrent(*req.LLMMaxConcurrent); err != nil {
 			writeErr(w, 400, err.Error())
@@ -3729,6 +3785,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 // edits are tested); empty API keys fall back to stored values so the user need
 // not retype them. Always 200 with {ok, error?, count?, backend?}.
 func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
+	if strict, _ := s.effectiveLLMPolicy(); strict {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": agent.WebSearchLocalOnlyMessage, "local_llm_only": true})
+		return
+	}
+
 	var req struct {
 		Backend   string `json:"web_search_backend"`
 		Proxy     string `json:"web_search_proxy"`
@@ -3767,7 +3828,11 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 	// 模型推理，30s 的通用上限偏紧，单独放宽。这里不预判配置能不能用——测这一下
 	// 本来就是给用户自己确认的手段，真跑不通时下面的报错比预判更有信息量。
 	probeQuery := "test"
-	if strings.TrimSpace(backend) == deepSeekWebSearchBackend {
+	if strings.EqualFold(strings.TrimSpace(backend), deepSeekWebSearchBackend) {
+		if strict, _ := s.m.effectiveLLMPolicy(); strict {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": agent.DeepSeekLocalOnlyMessage, "backend": backend})
+			return
+		}
 		cfg.DeepSeekBaseURL, cfg.DeepSeekAPIKey, cfg.DeepSeekModel = s.m.deepSeekSearchCreds()
 		wall = 120 * time.Second
 		// 搜索词由 DeepSeek 端的模型自行决定，"test" 太空泛会让它跳过搜索直接作答。
@@ -3775,6 +3840,10 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), wall)
 	defer cancel()
+	if strict, _ := s.effectiveLLMPolicy(); strict {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": agent.WebSearchLocalOnlyMessage, "backend": backend, "local_llm_only": true})
+		return
+	}
 	results, err := actool.WebSearchProbe(ctx, cfg, probeQuery, 3)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "backend": backend})

@@ -15,13 +15,22 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { CopyButton } from "@/components/copy-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
@@ -30,21 +39,104 @@ import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import {
   applyLLMProfilePreset,
+  getLLMProfilePreset,
+  isCloudEconomyPreset,
   isLLMProfilePresetId,
+  isOllamaPreset,
   LLM_PROFILE_PRESET_IDS,
   type LLMProfilePresetId,
+  selectInstalledOllamaModel,
 } from "@/lib/llm-profile-presets";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import { pullCommand } from "@/lib/ollama-pull";
+import type {
+  LLMModelDetail,
+  LLMPoolMember,
+  LLMPoolStatus,
+  LLMProfile,
+  LLMRetryOverride,
+  LLMTestResult,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
 
 const PRESET_LABELS: Record<LLMProfilePresetId, { labelKey: string; helpKey: string }> = {
+  "zai-general": {
+    labelKey: "llm.preset.zaiGeneral",
+    helpKey: "llm.preset.zaiGeneralHelp",
+  },
+  "zai-coding-reference": {
+    labelKey: "llm.preset.zaiCoding",
+    helpKey: "llm.preset.zaiCodingHelp",
+  },
+  deepseek: {
+    labelKey: "llm.preset.deepseek",
+    helpKey: "llm.preset.deepseekHelp",
+  },
+  claude: {
+    labelKey: "llm.preset.claude",
+    helpKey: "llm.preset.claudeHelp",
+  },
+  openai: {
+    labelKey: "llm.preset.openai",
+    helpKey: "llm.preset.openaiHelp",
+  },
+  qwen: {
+    labelKey: "llm.preset.qwen",
+    helpKey: "llm.preset.qwenHelp",
+  },
+  kimi: {
+    labelKey: "llm.preset.kimi",
+    helpKey: "llm.preset.kimiHelp",
+  },
+  openrouter: {
+    labelKey: "llm.preset.openrouter",
+    helpKey: "llm.preset.openrouterHelp",
+  },
   "opencode-go": {
     labelKey: "llm.preset.opencodeGo",
     helpKey: "llm.preset.opencodeGoHelp",
   },
+  "ollama-host": {
+    labelKey: "llm.preset.ollamaHost",
+    helpKey: "llm.preset.ollamaHostHelp",
+  },
+  "ollama-docker-host": {
+    labelKey: "llm.preset.ollamaDockerHost",
+    helpKey: "llm.preset.ollamaDockerHostHelp",
+  },
+  "ollama-compose": {
+    labelKey: "llm.preset.ollamaCompose",
+    helpKey: "llm.preset.ollamaComposeHelp",
+  },
 };
+
+const CLOUD_PRESETS: LLMProfilePresetId[] = [
+  "zai-general",
+  "zai-coding-reference",
+  "deepseek",
+  "claude",
+  "openai",
+  "qwen",
+  "kimi",
+  "openrouter",
+  "opencode-go",
+];
+const LOCAL_PRESETS: LLMProfilePresetId[] = ["ollama-host", "ollama-docker-host", "ollama-compose"];
+
+const FORMATS = ["anthropic", "openai", "openai-responses", "ollama"] as const;
+type ProfileFormat = (typeof FORMATS)[number];
+
+const keyOptional = (p: LLMProfile) => p.api_key_optional ?? p.format === "ollama";
+
+function ollamaContextTokens(k: string) {
+  const n = Number(k) || 0;
+  return (n <= 0 ? 32 : Math.max(16, n)) * 1024;
+}
+
+function lacksTools(d?: { capabilities?: string[]; error?: string }) {
+  return !!d && !d.error && Array.isArray(d.capabilities) && !d.capabilities.includes("tools");
+}
 
 // 思考开关(thinking.type)与思考强度(reasoning_effort)是两个【互相独立】的字段，
 // 各自单独设置——有些接口没有 thinking 字段、只靠强度参数就能激活思考，故需解耦。
@@ -57,6 +149,7 @@ const THINKING_TYPES: { value: string; labelKey: string }[] = [
   { value: NONE, labelKey: "llm.thinking.none" },
   { value: "disabled", labelKey: "llm.thinking.disabled" },
   { value: "enabled", labelKey: "llm.thinking.enabled" },
+  { value: "adaptive", labelKey: "llm.thinking.adaptive" },
 ];
 // 输出上限用哪个请求字段名（仅 openai 格式有意义）。NONE ↔ "" 走同一套哨兵转换。
 const MAX_TOKENS_FIELDS: { value: string; label?: string; labelKey?: string }[] = [
@@ -68,6 +161,7 @@ const MAX_TOKENS_FIELD_HINT_KEYS: Record<string, string> = {
   openai: "llm.maxTokensHint.openai",
   anthropic: "llm.maxTokensHint.anthropic",
   "openai-responses": "llm.maxTokensHint.openaiResponses",
+  ollama: "llm.maxTokensHint.ollama",
 };
 const EFFORT_LEVELS: { value: string; label?: string; labelKey?: string }[] = [
   { value: NONE, labelKey: "llm.effort.none" },
@@ -93,6 +187,12 @@ function healthOf(
   t: (key: string, params?: Record<string, string | number>) => string,
 ): Health {
   if (!p.api_key_hint) {
+    if (keyOptional(p)) {
+      return {
+        label: t("llm.health.normal"),
+        cls: "border-emerald-500/40 text-emerald-600 dark:text-emerald-400",
+      };
+    }
     return {
       label: t("llm.health.noKey"),
       cls: "border-muted-foreground/40 text-muted-foreground",
@@ -185,9 +285,7 @@ function PoolSheet({
           <SheetTitle className="flex items-center gap-2">
             <ZapIcon className="size-4" /> {t("llm.pool.title")}
           </SheetTitle>
-          <SheetDescription>
-            {t("llm.pool.desc")}
-          </SheetDescription>
+          <SheetDescription>{t("llm.pool.desc")}</SheetDescription>
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-6">
@@ -209,9 +307,7 @@ function PoolSheet({
               <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
                 <div className="grid gap-0.5">
                   <Label className="text-sm">{t("llm.pool.bindFallbackLabel")}</Label>
-                  <p className="text-muted-foreground text-xs">
-                    {t("llm.pool.bindFallbackHint")}
-                  </p>
+                  <p className="text-muted-foreground text-xs">{t("llm.pool.bindFallbackHint")}</p>
                 </div>
                 <Switch
                   checked={pool?.bind_fallback ?? false}
@@ -262,10 +358,14 @@ function PoolSheet({
                         {excluded && <Badge variant="outline">{t("llm.pool.excludedBadge")}</Badge>}
                         <div className="ml-auto flex items-center gap-2">
                           {m.state === "tripped" && m.cooldown_secs > 0 && (
-                            <span className="text-muted-foreground text-xs">{t("llm.pool.cooldownText", { time: cooldownText(m.cooldown_secs) })}</span>
+                            <span className="text-muted-foreground text-xs">
+                              {t("llm.pool.cooldownText", { time: cooldownText(m.cooldown_secs) })}
+                            </span>
                           )}
                           {m.state === "degraded" && (
-                            <span className="text-muted-foreground text-xs">{t("llm.pool.continuousFails", { count: m.fails })}</span>
+                            <span className="text-muted-foreground text-xs">
+                              {t("llm.pool.continuousFails", { count: m.fails })}
+                            </span>
                           )}
                           {m.state !== "ok" && (
                             <Button
@@ -329,7 +429,7 @@ function ProfileSheet({
   const { t } = useI18n();
   const isNew = !profile;
   const [name, setName] = React.useState("");
-  const [format, setFormat] = React.useState<"anthropic" | "openai" | "openai-responses">("anthropic");
+  const [format, setFormat] = React.useState<ProfileFormat>("anthropic");
   const [model, setModel] = React.useState("");
   const [baseUrl, setBaseUrl] = React.useState("");
   const [proxy, setProxy] = React.useState("");
@@ -348,12 +448,18 @@ function ProfileSheet({
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
   const [userAgent, setUserAgent] = React.useState(""); // 自定义 User-Agent;空=保持默认 UA
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
+  const [keepAlive, setKeepAlive] = React.useState("");
+  const [maxConcurrent, setMaxConcurrent] = React.useState("0");
+  const [modelDetails, setModelDetails] = React.useState<LLMModelDetail[]>([]);
+  const [diag, setDiag] = React.useState<LLMTestResult | null>(null);
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [models, setModels] = React.useState<string[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [modelsError, setModelsError] = React.useState("");
   const [preset, setPreset] = React.useState<LLMProfilePresetId | "">("");
+  const modelsRequest = React.useRef(0);
 
   // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
   // 就是一次干净的开始，不会留下上一个配置的残影。
@@ -361,7 +467,7 @@ function ProfileSheet({
     if (!open) return;
     setPreset("");
     setName(profile?.name ?? "");
-    setFormat(profile?.format === "openai" || profile?.format === "openai-responses" ? profile.format : "anthropic");
+    setFormat(profile?.format ? (profile.format as ProfileFormat) : "anthropic");
     setModel(profile?.model ?? "");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
@@ -378,19 +484,54 @@ function ProfileSheet({
     setSessionHeaderKey(profile?.session_header_key ?? "");
     setUserAgent(profile?.user_agent ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
+    setKeepAlive(profile?.keep_alive ?? "");
+    setMaxConcurrent(String(profile?.llm_max_concurrent ?? 0));
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
     setModels([]);
+    setModelDetails([]);
+    setDiag(null);
+    setModelsError("");
     setModelsOpen(false);
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+  const detailOf = (m: string) => modelDetails.find((d) => (d.name ?? d.model) === m || d.model === m);
+  const keyPlaceholder = format === "ollama" ? t("llm.field.apiKeyOptional") : "sk-…";
+  const pull = diag && !diag.ok ? pullCommand(diag.error ?? "", model) : "";
+  const testedModel = diag?.ok && diag.model === model.trim() ? diag : undefined;
+  const modelLacksTools =
+    format === "ollama" &&
+    (lacksTools(detailOf(model.trim())) ||
+      (!!testedModel?.capabilities?.length && testedModel.tools_supported === false));
+  const gigabytes = (n: number) => (n / 1e9).toFixed(1) + " GB";
+
+  function changeFormat(nextFormat: ProfileFormat) {
+    setModels([]);
+    setModelDetails([]);
+    setModelsError("");
+    setModelsOpen(false);
+    setFormat(nextFormat);
+    if (nextFormat === "ollama" && format !== "ollama") {
+      const cloudTemplateURL = preset && !isOllamaPreset(preset) ? getLLMProfilePreset(preset).base_url : "";
+      const nextBaseUrl =
+        !baseUrl.trim() || baseUrl === cloudTemplateURL ? getLLMProfilePreset("ollama-host").base_url : baseUrl;
+      setApiKey("");
+      setKeyHint("");
+      setBaseUrl(nextBaseUrl);
+      if (isNew) {
+        setModel("");
+        void loadModels({ format: "ollama", baseUrl: nextBaseUrl, apiKey: "", proxy }, true);
+      }
+    }
+    setPreset("");
+  }
 
   function applyPreset(id: string) {
     if (!isNew || !isLLMProfilePresetId(id)) return;
     const next = applyLLMProfilePreset({ format, model, base_url: baseUrl }, id);
     setPreset(id);
-    setFormat(next.format);
+    setFormat(next.format as ProfileFormat);
     setModel(next.model);
     setBaseUrl(next.base_url);
     setThinkingType(fromStore(next.thinking_type));
@@ -398,37 +539,60 @@ function ProfileSheet({
     setCw(String(next.context_window_k));
     setMaxTokens(String(next.max_tokens));
     setMaxTokensField(fromStore(next.max_tokens_field));
-    if (next.session_header_key) setSessionHeaderKey(next.session_header_key);
+    if ("api_key" in next) setApiKey(next.api_key);
+    if ("keep_alive" in next) setKeepAlive(next.keep_alive);
+    if ("llm_max_concurrent" in next) setMaxConcurrent(String(next.llm_max_concurrent));
+    if ("session_header_key" in next && next.session_header_key) {
+      setSessionHeaderKey(next.session_header_key);
+    }
     setModels([]);
+    setModelDetails([]);
+    setModelsError("");
     setModelsOpen(false);
+    if (isOllamaPreset(id)) {
+      void loadModels({ format: "ollama", baseUrl: next.base_url, apiKey: "", proxy }, true);
+    }
   }
 
-  async function loadModels() {
-    if (loadingModels) return;
+  async function loadModels(target = { format, baseUrl, apiKey, proxy }, selectDefault = false) {
+    const request = ++modelsRequest.current;
     setLoadingModels(true);
+    setModelsError("");
     setModels([]);
+    setModelDetails([]);
+    setModelsOpen(false);
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(target.format, target.baseUrl, target.apiKey, target.proxy, profileId);
+      if (request !== modelsRequest.current) return;
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
-        setModelsOpen(true);
-        toast.success(t("llm.models.loadedCount", { count: r.models.length }));
+        setModelDetails(r.model_details ?? []);
+        if (selectDefault) {
+          setModel(selectInstalledOllamaModel(r.models, r.model_details));
+        } else {
+          setModelsOpen(true);
+          toast.success(t("llm.models.loadedCount", { count: r.models.length }));
+        }
       } else {
-        toast.error(t("llm.models.loadFailed", { message: r.error ?? t("llm.models.empty") }));
+        const message = t("llm.models.loadFailed", { message: r.error ?? t("llm.models.empty") });
+        setModelsError(message);
+        toast.error(message);
       }
     } catch (e) {
-      toast.error(t("llm.models.loadError", { message: (e as Error).message }));
+      if (request !== modelsRequest.current) return;
+      const message = t("llm.models.loadError", { message: (e as Error).message });
+      setModelsError(message);
+      toast.error(message);
     } finally {
-      setLoadingModels(false);
+      if (request === modelsRequest.current) setLoadingModels(false);
     }
   }
 
   async function testConnection() {
     if (testing) return;
     setTesting(true);
+    setDiag(null);
     try {
-      // 用配置实际会跑的思考参数来测，这样不支持该字段的模型在这里就失败，
-      // 而不是等到跑任务时才炸。传 profile id：Key 输入框留空时用已存的 Key。
       const r = await api.testLLM(
         format,
         model,
@@ -441,8 +605,14 @@ function ProfileSheet({
         streaming,
         sessionHeaderKey.trim(),
         userAgent.trim(),
+        {
+          context_window_k: Number(cw) || 0,
+          keep_alive: keepAlive.trim(),
+          max_tokens: Math.max(0, Number(maxTokens) || 0),
+          llm_max_concurrent: Math.max(0, Number(maxConcurrent) || 0),
+        },
       );
-      // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
+      if (format === "ollama") setDiag(r);
       if (r.ok)
         toast.success(t("llm.test.success", { latency: r.latency_ms ?? "?", model: r.model ?? model }), {
           description: r.reply ? t("llm.test.reply", { reply: r.reply }) : undefined,
@@ -480,12 +650,12 @@ function ProfileSheet({
         pool_exclude: poolExclude,
         streaming,
         max_tokens: Math.max(0, Number(maxTokens) || 0),
-        // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
-        // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
         user_agent: userAgent.trim(),
         retry,
+        keep_alive: keepAlive.trim(),
+        llm_max_concurrent: Math.max(0, Number(maxConcurrent) || 0),
       });
       if (isNew) toast.success(t("llm.save.created", { name: name.trim() }));
       else toast.success(profile?.is_default ? t("llm.save.savedActive") : t("common.saved"));
@@ -513,11 +683,7 @@ function ProfileSheet({
               </Badge>
             )}
           </SheetTitle>
-          <SheetDescription>
-            {isNew
-              ? t("llm.sheet.newDesc")
-              : t("llm.sheet.editDesc")}
-          </SheetDescription>
+          <SheetDescription>{isNew ? t("llm.sheet.newDesc") : t("llm.sheet.editDesc")}</SheetDescription>
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
@@ -529,17 +695,26 @@ function ProfileSheet({
                   <SelectValue placeholder={t("llm.preset.choose")} />
                 </SelectTrigger>
                 <SelectContent>
-                  {LLM_PROFILE_PRESET_IDS.map((id) => (
-                    <SelectItem key={id} value={id}>
-                      {t(PRESET_LABELS[id].labelKey)}
-                    </SelectItem>
-                  ))}
+                  <SelectGroup>
+                    <SelectLabel>{t("llm.preset.groupCloud")}</SelectLabel>
+                    {CLOUD_PRESETS.map((id) => (
+                      <SelectItem key={id} value={id}>
+                        {t(PRESET_LABELS[id].labelKey)}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                  <SelectGroup>
+                    <SelectLabel>{t("llm.preset.groupLocal")}</SelectLabel>
+                    {LOCAL_PRESETS.map((id) => (
+                      <SelectItem key={id} value={id}>
+                        {t(PRESET_LABELS[id].labelKey)}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
                 </SelectContent>
               </Select>
               <p className="text-muted-foreground text-xs">{t("llm.preset.introduction")}</p>
-              {preset && (
-                <p className="text-muted-foreground text-xs">{t(PRESET_LABELS[preset].helpKey)}</p>
-              )}
+              {preset && <p className="text-muted-foreground text-xs">{t(PRESET_LABELS[preset].helpKey)}</p>}
             </div>
           )}
           <div className="grid gap-4 sm:grid-cols-2">
@@ -554,7 +729,7 @@ function ProfileSheet({
             </div>
             <div className="grid gap-2">
               <Label>{t("llm.field.format")}</Label>
-              <Select value={format} onValueChange={(v) => setFormat(v as "anthropic" | "openai" | "openai-responses")}>
+              <Select value={format} onValueChange={(v) => changeFormat(v as ProfileFormat)}>
                 <SelectTrigger>
                   <SelectValue placeholder={t("llm.placeholder.format")} />
                 </SelectTrigger>
@@ -562,6 +737,7 @@ function ProfileSheet({
                   <SelectItem value="anthropic">Anthropic</SelectItem>
                   <SelectItem value="openai">OpenAI (Chat Completions)</SelectItem>
                   <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
+                  <SelectItem value="ollama">{t("llm.format.ollama")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -573,7 +749,7 @@ function ProfileSheet({
               <Input
                 id="p-model"
                 className="font-mono"
-                placeholder="claude-opus-4-8"
+                placeholder={format === "ollama" ? "llama3:8b" : "claude-opus-4-8"}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
               />
@@ -587,31 +763,75 @@ function ProfileSheet({
                     size="icon"
                     className="shrink-0"
                     disabled={loadingModels}
-                    onClick={loadModels}
+                    onClick={() => void loadModels()}
                     title={t("llm.field.loadModelsTitle")}
                   >
                     {loadingModels ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
                   </Button>
                 </PopoverTrigger>
                 {models.length > 0 && (
-                  <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                  <PopoverContent className="max-h-72 w-80 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
+                    {models.map((m) => {
+                      const d = detailOf(m);
+                      return (
+                        <button
+                          key={m}
+                          type="button"
+                          className="grid w-full shrink-0 gap-1 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                          onClick={() => {
+                            modelsRequest.current += 1;
+                            setLoadingModels(false);
+                            setModelsError("");
+                            setModel(m);
+                            setModelsOpen(false);
+                          }}
+                        >
+                          <span className="font-mono">{m}</span>
+                          {d && (
+                            <span className="flex flex-wrap items-center gap-1 text-muted-foreground">
+                              {d.details?.parameter_size && <span>{d.details.parameter_size}</span>}
+                              {d.details?.quantization_level && (
+                                <span className="font-mono">{d.details.quantization_level}</span>
+                              )}
+                              {(["tools", "thinking", "vision"] as const)
+                                .filter((c) => d.capabilities?.includes(c))
+                                .map((c) => (
+                                  <Badge key={c} variant="outline" className="h-4 px-1 font-mono text-[10px]">
+                                    {c}
+                                  </Badge>
+                                ))}
+                              {lacksTools(d) && (
+                                <Badge
+                                  variant="outline"
+                                  className="h-4 border-amber-500/50 px-1 text-[10px] text-amber-600 dark:text-amber-400"
+                                >
+                                  {t("llm.models.noToolsBadge")}
+                                </Badge>
+                              )}
+                              {d.error && (
+                                <span className="truncate" title={d.error}>
+                                  {t("llm.models.capabilitiesUnknown", { error: d.error })}
+                                </span>
+                              )}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </PopoverContent>
                 )}
               </Popover>
             </div>
+            {modelsError && (
+              <p role="alert" className="text-destructive text-xs">
+                {modelsError}
+              </p>
+            )}
+            {modelLacksTools && (
+              <p role="alert" className="text-amber-700 text-xs dark:text-amber-400">
+                {t("llm.models.noTools")}
+              </p>
+            )}
           </div>
 
           <div className="grid gap-2">
@@ -634,9 +854,7 @@ function ProfileSheet({
               value={proxy}
               onChange={(e) => setProxy(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">
-              {t("llm.field.proxyHint")}
-            </p>
+            <p className="text-muted-foreground text-xs">{t("llm.field.proxyHint")}</p>
           </div>
 
           <div className="grid gap-2">
@@ -648,9 +866,7 @@ function ProfileSheet({
               value={sessionHeaderKey}
               onChange={(e) => setSessionHeaderKey(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">
-              {t("llm.field.sessionHeaderHint")}
-            </p>
+            <p className="text-muted-foreground text-xs">{t("llm.field.sessionHeaderHint")}</p>
           </div>
 
           <div className="grid gap-2">
@@ -662,9 +878,7 @@ function ProfileSheet({
               value={userAgent}
               onChange={(e) => setUserAgent(e.target.value)}
             />
-            <p className="text-muted-foreground text-xs">
-              {t("llm.userAgentHint")}
-            </p>
+            <p className="text-muted-foreground text-xs">{t("llm.userAgentHint")}</p>
           </div>
 
           <div className="grid gap-2">
@@ -672,10 +886,11 @@ function ProfileSheet({
             <Input
               id="p-api-key"
               type="password"
-              placeholder={keyHint ? t("llm.placeholder.apiKeyConfigured", { hint: keyHint }) : "sk-…"}
+              placeholder={keyHint ? t("llm.placeholder.apiKeyConfigured", { hint: keyHint }) : keyPlaceholder}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
             />
+            {format === "ollama" && <p className="text-muted-foreground text-xs">{t("llm.field.ollamaKeyHelp")}</p>}
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">
@@ -701,7 +916,37 @@ function ProfileSheet({
             </div>
           </div>
           <p className="-mt-2 text-muted-foreground text-xs">
-            {t("llm.field.rateAndCwHint")}
+            {format === "ollama" ? t("llm.field.contextOllama") : t("llm.field.rateAndCwHint")}
+          </p>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid gap-2">
+              <Label htmlFor="p-max-concurrent">{t("llm.field.maxConcurrent")}</Label>
+              <Input
+                id="p-max-concurrent"
+                type="number"
+                min={0}
+                value={maxConcurrent}
+                onChange={(e) => setMaxConcurrent(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            {format === "ollama" && (
+              <div className="grid gap-2">
+                <Label htmlFor="p-keep-alive">{t("llm.field.keepAlive")}</Label>
+                <Input
+                  id="p-keep-alive"
+                  className="font-mono"
+                  value={keepAlive}
+                  onChange={(e) => setKeepAlive(e.target.value)}
+                  placeholder="30m"
+                />
+              </div>
+            )}
+          </div>
+          <p className="-mt-2 text-muted-foreground text-xs">
+            {t("llm.field.maxConcurrentHelp")}
+            {format === "ollama" && <> {t("llm.field.keepAliveHelp")}</>}
           </p>
 
           <div className="grid gap-3 rounded-lg border p-3">
@@ -710,9 +955,7 @@ function ProfileSheet({
                 <Label htmlFor="p-priority" className="text-sm">
                   {t("llm.field.priority")}
                 </Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.priorityHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.priorityHint")}</p>
               </div>
               <Input
                 id="p-priority"
@@ -725,18 +968,14 @@ function ProfileSheet({
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
                 <Label className="text-sm">{t("llm.field.poolExclude")}</Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.poolExcludeHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.poolExcludeHint")}</p>
               </div>
               <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label={t("llm.field.poolExclude")} />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
                 <Label className="text-sm">{t("llm.field.streaming")}</Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.streamingHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.streamingHint")}</p>
               </div>
               <Switch checked={streaming} onCheckedChange={setStreaming} aria-label={t("llm.field.streaming")} />
             </div>
@@ -748,9 +987,7 @@ function ProfileSheet({
                 <Label htmlFor="p-max-tokens" className="text-sm">
                   {t("llm.field.maxTokens")}
                 </Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.maxTokensHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.maxTokensHint")}</p>
               </div>
               <Input
                 id="p-max-tokens"
@@ -790,9 +1027,7 @@ function ProfileSheet({
             <div className="flex items-center justify-between gap-4">
               <div className="grid gap-0.5">
                 <Label className="text-sm">{t("llm.field.thinkingType")}</Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.thinkingTypeHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.thinkingTypeHint")}</p>
               </div>
               <Select value={thinkingType} onValueChange={setThinkingType}>
                 <SelectTrigger className="w-32 shrink-0">
@@ -810,9 +1045,7 @@ function ProfileSheet({
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
                 <Label className="text-sm">{t("llm.field.effort")}</Label>
-                <p className="text-muted-foreground text-xs">
-                  {t("llm.field.effortHint")}
-                </p>
+                <p className="text-muted-foreground text-xs">{t("llm.field.effortHint")}</p>
               </div>
               <Select value={effort} onValueChange={setEffort}>
                 <SelectTrigger className="w-32 shrink-0">
@@ -831,6 +1064,84 @@ function ProfileSheet({
 
           <ProfileRetryFields value={retry} onChange={setRetry} />
         </div>
+
+        {format === "ollama" && diag && (
+          <section aria-label={t("llm.diag.title")} className="grid gap-1.5 border-t px-4 py-3 text-xs">
+            <p className="font-medium text-sm">{t("llm.diag.title")}</p>
+            {diag.ok ? (
+              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                <dt className="text-muted-foreground">{t("llm.diag.context")}</dt>
+                <dd
+                  className={
+                    diag.context_verified
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-amber-700 dark:text-amber-400"
+                  }
+                >
+                  {diag.context_length
+                    ? t(diag.context_verified ? "llm.diag.contextOk" : "llm.diag.contextLow", {
+                        actual: diag.context_length,
+                        requested: ollamaContextTokens(cw),
+                      })
+                    : t("llm.diag.contextUnknown", { requested: ollamaContextTokens(cw) })}
+                </dd>
+                <dt className="text-muted-foreground">{t("llm.diag.tools")}</dt>
+                <dd
+                  className={
+                    diag.tool_call_verified
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-amber-700 dark:text-amber-400"
+                  }
+                >
+                  {t(diag.tool_call_verified ? "llm.diag.toolsOk" : "llm.diag.toolsFail")}
+                </dd>
+                <dt className="text-muted-foreground">{t("llm.diag.load")}</dt>
+                <dd>{t("llm.diag.loadValue", { ms: Math.round(diag.load_duration_ms ?? 0) })}</dd>
+                <dt className="text-muted-foreground">{t("llm.diag.speed")}</dt>
+                <dd>{t("llm.diag.speedValue", { tps: (diag.tokens_per_second ?? 0).toFixed(1) })}</dd>
+                <dt className="text-muted-foreground">{t("llm.diag.gpu")}</dt>
+                <dd className={diag.gpu_offload_percent === undefined ? "text-muted-foreground" : undefined}>
+                  {diag.gpu_offload_percent === undefined
+                    ? t("llm.diag.gpuUnknown")
+                    : t("llm.diag.gpuValue", {
+                        percent: `${Math.round(diag.gpu_offload_percent)}%`,
+                        vram: gigabytes(diag.size_vram_bytes ?? 0),
+                        total: gigabytes(diag.size_bytes ?? 0),
+                      })}
+                </dd>
+              </dl>
+            ) : (
+              <>
+                {pull && (
+                  <div className="grid gap-1">
+                    <p className="text-muted-foreground">{t("llm.diag.missingModel")}</p>
+                    <div className="flex items-center gap-1">
+                      <code className="flex-1 rounded bg-muted px-2 py-1 font-mono">{pull}</code>
+                      <CopyButton text={pull} />
+                    </div>
+                  </div>
+                )}
+                <p className="break-words font-mono text-destructive">{diag.error}</p>
+              </>
+            )}
+            {diag.gpu_offload_percent !== undefined && <p className="text-muted-foreground">{t("llm.diag.gpuNote")}</p>}
+            {(diag.gpu_offload_percent !== undefined && diag.gpu_offload_percent <= 80) ||
+            diag.other_loaded_models?.length ||
+            diag.judge_model_mismatch ? (
+              <ul role="status" className="grid gap-1 text-amber-700 dark:text-amber-400">
+                {diag.gpu_offload_percent !== undefined && diag.gpu_offload_percent <= 80 && (
+                  <li>{t("llm.diag.warnOffload")}</li>
+                )}
+                {!!diag.other_loaded_models?.length && (
+                  <li className="break-words">
+                    {t("llm.diag.warnOtherModels", { models: diag.other_loaded_models.join(", ") })}
+                  </li>
+                )}
+                {diag.judge_model_mismatch && <li>{t("llm.diag.warnJudge")}</li>}
+              </ul>
+            ) : null}
+          </section>
+        )}
 
         <div className="flex gap-2 border-t px-4 py-3">
           <Button variant="outline" onClick={testConnection} disabled={testing}>
@@ -923,9 +1234,7 @@ export default function LLMPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="font-semibold text-xl tracking-tight">LLM</h1>
-          <p className="text-muted-foreground text-sm">
-            {t("llm.page.subtitle")}
-          </p>
+          <p className="text-muted-foreground text-sm">{t("llm.page.subtitle")}</p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => setPoolOpen(true)}>
@@ -994,6 +1303,7 @@ export default function LLMPage() {
 
                     <div className="flex flex-wrap gap-x-3 gap-y-0.5 pl-6 text-muted-foreground text-xs">
                       {p.api_key_hint && <span>{p.api_key_hint}</span>}
+                      {!p.api_key_hint && keyOptional(p) && <span>{t("llm.card.keyless")}</span>}
                       <span>
                         {p.rate_per_second}/s · {p.rate_per_minute}/min
                       </span>

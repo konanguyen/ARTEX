@@ -26,8 +26,11 @@ type Database struct {
 
 // Config is the on-disk config file shape.
 type Config struct {
-	Database Database `json:"database"`
-	SkillDir string   `json:"skill_dir"`
+	Database             Database `json:"database"`
+	SkillDir             string   `json:"skill_dir"`
+	LLM                  LLM      `json:"llm"`
+	LocalLLMOnly         bool     `json:"local_llm_only"`
+	LocalLLMAllowedCIDRs []string `json:"local_llm_allowed_cidrs"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
@@ -93,6 +96,9 @@ func isGoRunDir(dir string) bool {
 // The first existing file wins. If none exist, the CWD path is returned so the
 // "not found" message points at the project dir the user most likely expected.
 func Path() string {
+	if v := strings.TrimSpace(os.Getenv("SCOPEWEAVER_CONFIG")); v != "" {
+		return v
+	}
 	if v := strings.TrimSpace(os.Getenv("ARTEX_CONFIG")); v != "" {
 		return v
 	}

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
@@ -35,10 +36,12 @@ func (s *Server) chatGuard() *guard.Guard {
 // runs a one-shot JSON classification with an explanation for every verdict.
 func (s *Server) wireInterceptReviewer() {
 	s.m.interceptor.SetReviewer(func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
-		prov, profileID, err := s.judgeProvider(profileID)
+		prov, profileID, err := s.judgeProvider(ctx, profileID)
 		if err != nil {
 			return intercept.Decision{ProfileID: profileID}, err
 		}
+		ctx = intercept.WithProviderOrigin(ctx)
+		ctx = withNativeRole(ctx, "judge")
 		// Tag this call's usage as the "judge" lane so the config page can report
 		// how much the fallback approval has spent, separate from model profiles.
 		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
@@ -54,10 +57,12 @@ func (s *Server) wireInterceptReviewer() {
 	})
 	// Closed mode: one call answers every question; intercept parses and decides.
 	s.m.interceptor.SetCompleter(func(ctx context.Context, profileID int64, system, user string) (string, int64, error) {
-		prov, profileID, err := s.judgeProvider(profileID)
+		prov, profileID, err := s.judgeProvider(ctx, profileID)
 		if err != nil {
 			return "", profileID, err
 		}
+		ctx = intercept.WithProviderOrigin(ctx)
+		ctx = withNativeRole(ctx, "judge")
 		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
 		text, err := streamCollectText(ctx, prov, system, user, closedJudgeMaxTokens)
 		return text, profileID, err
@@ -69,18 +74,43 @@ func (s *Server) wireInterceptReviewer() {
 const closedJudgeMaxTokens = 1536
 
 // judgeProvider resolves the judge profile (0 -> active/default) to a provider.
-func (s *Server) judgeProvider(profileID int64) (llm.Provider, int64, error) {
-	if profileID == 0 {
-		if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
-			profileID = p.ID
+func (s *Server) judgeProvider(ctx context.Context, profileID int64) (llm.Provider, int64, error) {
+	var prov llm.Provider
+	var cfg agent.Config
+	if origin, preferred := intercept.ReviewProviderOrigin(ctx); preferred {
+		var ok bool
+		cfg, ok = origin.Data.(agent.Config)
+		if !ok {
+			return nil, profileID, fmt.Errorf("judge model profile %d is unavailable", profileID)
+		}
+		profileID = origin.ProfileID
+	} else {
+		if profileID == 0 {
+			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
+				profileID = p.ID
+			}
+		}
+		if profileID == 0 {
+			return nil, 0, fmt.Errorf("no usable judge model is configured")
+		}
+		var ok bool
+		prov, cfg, ok = s.providerForProfile(profileID)
+		if !ok {
+			return nil, profileID, fmt.Errorf("judge model profile %d is unavailable", profileID)
 		}
 	}
-	if profileID == 0 {
-		return nil, 0, fmt.Errorf("no usable judge model is configured")
-	}
-	prov, _, ok := s.providerForProfile(profileID)
-	if !ok {
-		return nil, profileID, fmt.Errorf("judge model profile %d is unavailable", profileID)
+	if cfg.Format == llm.Format("ollama") {
+		// JSON mode is specific to the judge; retain the same endpoint admission
+		// gate as task inference so this separate provider cannot overfill VRAM.
+		cfg = s.applyLLMPolicy(cfg)
+		cfg.JSONOutput = true
+		cfg.JSONSchema = map[string]any{"type": "object", "properties": map[string]any{"decision": map[string]any{"type": "string", "enum": []string{"allow", "ask", "deny"}}, "comment": map[string]any{"type": "string", "minLength": 10}}, "required": []string{"decision", "comment"}, "additionalProperties": false}
+		var err error
+		prov, err = cfg.NewProvider()
+		if err != nil {
+			return nil, profileID, err
+		}
+		prov = s.profileConcurrencyProvider(prov, cfg)
 	}
 	return prov, profileID, nil
 }

@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -1923,6 +1922,10 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
+	if p.MaxConcurrent < 0 {
+		writeErr(w, 400, "profile llm_max_concurrent must be zero or greater (0 uses the global setting; native Ollama uses 1)")
+		return
+	}
 	if p.MaxTokens < 0 {
 		p.MaxTokens = 0
 	}
@@ -2166,12 +2169,10 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if req.Provider != "ollama" || p.Format == "ollama" {
+				apiKey = p.APIKey
+			}
 		}
-	}
-	if apiKey == "" {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": "API Key is required"})
-		return
 	}
 	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: use the stored one
 		req.Proxy = ""
@@ -2180,6 +2181,16 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 				req.Proxy = p.Proxy
 			}
 		}
+	}
+
+	cfg := s.applyLLMPolicy(agent.ConfigFrom(req.Provider, "", req.BaseURL, apiKey, req.Proxy))
+	if req.Provider == "ollama" {
+		s.listOllamaModels(w, r, cfg)
+		return
+	}
+	if !cfg.Ready() {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "API Key is required"})
+		return
 	}
 
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
@@ -2191,14 +2202,12 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	// back to the OpenAI endpoint at the stripped root.
 	candidates := modelListCandidates(provider, baseURL, apiKey)
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
-		}
+	client, err := cfg.HTTPClient()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	client.Timeout = 30 * time.Second
 
 	// Try each candidate; return the first that yields a non-empty model list.
 	var lastErr string

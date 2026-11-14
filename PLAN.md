@@ -132,7 +132,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - Cho phép hội thoại Pentest độc lập lưu lỗ hổng trực tiếp vào trang Findings (nhóm chưa gán task) và đọc lại qua các lượt (`#30`).
   - **File chính**: `chatstate/`, `db/chat_*.go`, `db/schema.sql`, `agent/chat_*.go`, `server/chat_*.go`, `web/src/app/(main)/chat/`.
 
-- [ ] **4.2. Hỗ trợ Ollama Native, Chế độ Zero-Egress `local_llm_only` & Cloud Economy Templates (`cskwork #22, #25, #27` + `BaaRai #128`)**
+- [x] **4.2. Hỗ trợ Ollama Native, Chế độ Zero-Egress `local_llm_only` & Cloud Economy Templates (`cskwork #22, #25, #27` + `BaaRai #128`)**
   - **Mô tả**:
     - Provider `ollama` native qua `/api/chat` (streaming, tool calls, thinking, `num_ctx`, `keep_alive`, tự liệt kê model đã cài, hiển thị % GPU memory, ưu tiên slot cho approval judge / main agent / side question, tự động nén sớm cho context ≤ 64K) kèm hỗ trợ `ollama` OpenAI-compatible (`BaaRai #128`).
     - Chính sách tùy chọn `local_llm_only` (`llmnet/`): khóa cứng kết nối LLM chỉ cho phép loopback và các CIDR tin cậy (`ARTEX_LOCAL_LLM_ALLOWED_CIDRS`), chặn redirect, proxy, web search và auto-update.

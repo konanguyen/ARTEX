@@ -713,14 +713,14 @@ AND NOT EXISTS (
 
 func taskArchiveAggregates(tx *sql.Tx, taskID, expID int64) (map[string]any, error) {
 	stats := map[string]any{}
-	var calls, input, output, cacheRead, cacheWrite int64
+	var calls, input, output, cacheRead, cacheWrite, reasoning int64
 	if err := tx.QueryRow(`SELECT count(*),COALESCE(sum(input_tokens),0),COALESCE(sum(output_tokens),0),
-COALESCE(sum(cache_read),0),COALESCE(sum(cache_write),0)
+COALESCE(sum(cache_read),0),COALESCE(sum(cache_write),0),COALESCE(sum(reasoning_tokens),0)
 FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.FormatInt(taskID, 10), expID).
-		Scan(&calls, &input, &output, &cacheRead, &cacheWrite); err != nil {
+		Scan(&calls, &input, &output, &cacheRead, &cacheWrite, &reasoning); err != nil {
 		return nil, err
 	}
-	stats["tokens"] = map[string]int64{"calls": calls, "input_tokens": input, "output_tokens": output, "cache_read_tokens": cacheRead, "cache_write_tokens": cacheWrite}
+	stats["tokens"] = map[string]int64{"calls": calls, "input_tokens": input, "output_tokens": output, "cache_read_tokens": cacheRead, "cache_write_tokens": cacheWrite, "reasoning_tokens": reasoning}
 	for _, item := range []struct {
 		name  string
 		query string
@@ -729,13 +729,13 @@ FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2`, strconv.Form
 		{"token_profiles", `SELECT COALESCE(jsonb_agg(to_jsonb(x)),'[]'::jsonb) FROM (
 SELECT COALESCE(profile_name,'') profile_name,count(*) calls,1 tasks,
        COALESCE(sum(input_tokens),0) input_tokens,COALESCE(sum(output_tokens),0) output_tokens,
-       COALESCE(sum(cache_read),0) cache_read_tokens,COALESCE(sum(cache_write),0) cache_write_tokens
+       COALESCE(sum(cache_read),0) cache_read_tokens,COALESCE(sum(cache_write),0) cache_write_tokens,COALESCE(sum(reasoning_tokens),0) reasoning_tokens
 FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2
 GROUP BY profile_name ORDER BY sum(input_tokens)+sum(output_tokens) DESC) x`, []any{strconv.FormatInt(taskID, 10), expID}},
 		{"token_daily", `SELECT COALESCE(jsonb_agg(to_jsonb(x)),'[]'::jsonb) FROM (
 SELECT COALESCE(profile_name,'') profile_name,to_char(ts AT TIME ZONE 'UTC','YYYY-MM-DD') date,
        COALESCE(sum(input_tokens),0) input_tokens,COALESCE(sum(output_tokens),0) output_tokens,
-       COALESCE(sum(cache_read),0) cache_read_tokens
+       COALESCE(sum(cache_read),0) cache_read_tokens,COALESCE(sum(reasoning_tokens),0) reasoning_tokens
 FROM llm_usage WHERE COALESCE(task_id,'')=$1 OR exploration_id=$2
 GROUP BY profile_name,date ORDER BY date) x`, []any{strconv.FormatInt(taskID, 10), expID}},
 		{"skills", `SELECT COALESCE(jsonb_object_agg(name,n),'{}'::jsonb) FROM (SELECT skill name,count(*) n FROM skill_usage WHERE (task_id=$1 OR exploration_id=$2) AND found GROUP BY skill) x`, []any{taskID, expID}},

@@ -23,7 +23,10 @@ type LLMUsage struct {
 	OutputTokens  int    `json:"output_tokens"`
 	CacheRead     int    `json:"cache_read"`
 	CacheWrite    int    `json:"cache_write"`
-	Status        string `json:"status"` // ok | error
+	// ReasoningTokens is the reasoning/thinking part of OutputTokens when the
+	// provider reports it (never added to output again).
+	ReasoningTokens int    `json:"reasoning_tokens"`
+	Status          string `json:"status"` // ok | error
 }
 
 const llmUsageSchema = `
@@ -60,6 +63,9 @@ func (d *DB) EnsureLLMUsageTable() error {
 	if _, err := tx.Exec(llmUsageSchema); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS reasoning_tokens INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -71,10 +77,10 @@ func (d *DB) InsertLLMUsage(u *LLMUsage) error {
 		expID = u.ExplorationID
 	}
 	_, err := d.Exec(`
-INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status)
-VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11)`,
+INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, reasoning_tokens, status)
+VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11,$12)`,
 		u.TaskID, expID, u.Worker, u.Model, u.ProfileName,
-		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status)
+		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.ReasoningTokens, u.Status)
 	return err
 }
 
@@ -86,7 +92,7 @@ func (d *DB) TokenByModel(taskID string) ([]ModelTokenStat, error) {
 	rows, err := d.Query(`
 SELECT COALESCE(NULLIF(model,''),'(unknown)') AS model, COUNT(*) AS calls,
        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0), COALESCE(SUM(reasoning_tokens),0)
 FROM llm_usage
 WHERE COALESCE(task_id,'') = $1
 GROUP BY model
@@ -99,7 +105,7 @@ ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
 	for rows.Next() {
 		var m ModelTokenStat
 		if err := rows.Scan(&m.Model, &m.Calls, &m.InputTokens, &m.OutputTokens,
-			&m.CacheReadTokens, &m.CacheWriteTokens); err != nil {
+			&m.CacheReadTokens, &m.CacheWriteTokens, &m.ReasoningTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -196,6 +202,7 @@ type ProfileDayUsage struct {
 	InputTokens     int    `json:"input_tokens"`
 	OutputTokens    int    `json:"output_tokens"`
 	CacheReadTokens int    `json:"cache_read_tokens"`
+	ReasoningTokens int    `json:"reasoning_tokens"`
 }
 
 // UsageDaily returns per-(profile, day) token buckets for the past `days` days
@@ -207,7 +214,7 @@ func (d *DB) UsageDaily(days int) ([]ProfileDayUsage, error) {
 	rows, err := d.Query(`
 SELECT COALESCE(profile_name,'') AS profile_name,
        to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
-       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0)
+       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0), COALESCE(SUM(reasoning_tokens),0)
 FROM llm_usage
 WHERE ts >= now() - ($1 * interval '1 day')
 GROUP BY profile_name, day
@@ -219,7 +226,7 @@ ORDER BY day`, days)
 	out := []ProfileDayUsage{}
 	for rows.Next() {
 		var p ProfileDayUsage
-		if err := rows.Scan(&p.ProfileName, &p.Date, &p.InputTokens, &p.OutputTokens, &p.CacheReadTokens); err != nil {
+		if err := rows.Scan(&p.ProfileName, &p.Date, &p.InputTokens, &p.OutputTokens, &p.CacheReadTokens, &p.ReasoningTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -247,6 +254,7 @@ ORDER BY day`, days)
 			current.Date = cold.Date
 			current.InputTokens += cold.InputTokens
 			current.OutputTokens += cold.OutputTokens
+			current.ReasoningTokens += cold.ReasoningTokens
 			current.CacheReadTokens += cold.CacheReadTokens
 			byKey[key] = current
 		}
@@ -267,10 +275,11 @@ ORDER BY day`, days)
 // JudgeDayUsage is one UTC-day token bucket for the intercept fallback judge,
 // for the config page's recent-spend sparkline.
 type JudgeDayUsage struct {
-	Date         string `json:"date"` // YYYY-MM-DD (UTC)
-	Calls        int    `json:"calls"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
+	Date            string `json:"date"` // YYYY-MM-DD (UTC)
+	Calls           int    `json:"calls"`
+	InputTokens     int    `json:"input_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
+	ReasoningTokens int    `json:"reasoning_tokens"`
 }
 
 // JudgeUsage is the cumulative token spend of the intercept fallback judge
@@ -279,6 +288,7 @@ type JudgeUsage struct {
 	Calls            int             `json:"calls"`
 	InputTokens      int             `json:"input_tokens"`
 	OutputTokens     int             `json:"output_tokens"`
+	ReasoningTokens  int             `json:"reasoning_tokens"`
 	CacheReadTokens  int             `json:"cache_read_tokens"`
 	CacheWriteTokens int             `json:"cache_write_tokens"`
 	Daily            []JudgeDayUsage `json:"daily"`
@@ -296,16 +306,16 @@ func (d *DB) JudgeUsageStats(days int) (JudgeUsage, error) {
 	var u JudgeUsage
 	err := d.QueryRow(`
 SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0), COALESCE(SUM(reasoning_tokens),0)
 FROM llm_usage
 WHERE worker = 'judge'`).Scan(&u.Calls, &u.InputTokens, &u.OutputTokens,
-		&u.CacheReadTokens, &u.CacheWriteTokens)
+		&u.CacheReadTokens, &u.CacheWriteTokens, &u.ReasoningTokens)
 	if err != nil {
 		return JudgeUsage{}, err
 	}
 	rows, err := d.Query(`
 SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
-       COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+       COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0)
 FROM llm_usage
 WHERE worker = 'judge' AND ts >= now() - ($1 * interval '1 day')
 GROUP BY day
@@ -317,7 +327,7 @@ ORDER BY day`, days)
 	u.Daily = []JudgeDayUsage{}
 	for rows.Next() {
 		var day JudgeDayUsage
-		if err := rows.Scan(&day.Date, &day.Calls, &day.InputTokens, &day.OutputTokens); err != nil {
+		if err := rows.Scan(&day.Date, &day.Calls, &day.InputTokens, &day.OutputTokens, &day.ReasoningTokens); err != nil {
 			return JudgeUsage{}, err
 		}
 		u.Daily = append(u.Daily, day)

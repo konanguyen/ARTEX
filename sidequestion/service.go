@@ -33,6 +33,7 @@ func (s SideQuestionService) Answer(ctx context.Context, req llm.CompletionReque
 			case llm.SEToolUseStart:
 				out.ToolUse = true
 			case llm.SEMessageStart, llm.SEMessageDelta:
+				// Recorder forwards deltas after metering cumulative provider usage.
 				out.Usage.Add(ev.Usage)
 			case llm.SEMessageStop:
 				complete = true

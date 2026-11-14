@@ -129,3 +129,39 @@ func TestCapturePropagatesThroughNormaProvider(t *testing.T) {
 		t.Errorf("RawResponse mismatch:\n got: %q\nwant: %q", capt.RawResponse(), sse)
 	}
 }
+
+func TestNativeCaptureRetainsRawTimingsAndCachedUsage(t *testing.T) {
+	const raw = `{"message":{"content":"native"},"done":true,"prompt_eval_count":19,"prompt_eval_cached_count":7,"eval_count":3,"total_duration":12345678,"load_duration":345678,"prompt_eval_duration":456789,"eval_duration":567890}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, raw) }))
+	defer srv.Close()
+	cfg := ConfigFrom("ollama", "fixture", srv.URL, "", "")
+	p, err := cfg.NewProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []bool{false, true} {
+		ctx, capture := llmrec.NewCapture(t.Context())
+		var usage llm.Usage
+		if stream {
+			for ev, err := range p.Stream(ctx, llm.CompletionRequest{Messages: []llm.Message{llm.UserText("test")}}) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ev.Type == llm.SEMessageDelta {
+					usage = ev.Usage
+				}
+			}
+		} else {
+			_, _, usage, err = p.Complete(ctx, llm.CompletionRequest{Messages: []llm.Message{llm.UserText("test")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if usage.InputTokens != 19 || usage.CacheReadTokens != 7 || usage.OutputTokens != 3 {
+			t.Fatalf("cached usage lost: %+v", usage)
+		}
+		if capture.RawResponse() != raw {
+			t.Fatalf("native timing wire lost: %s", capture.RawResponse())
+		}
+	}
+}

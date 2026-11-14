@@ -366,6 +366,8 @@ const (
 // JudgeConfig is the resolved LLM-fallback-judge configuration. Prompt is always
 // non-empty (falls back to DefaultJudgePrompt).
 type JudgeConfig struct {
+	preferredOrigin   *ProviderOrigin
+	originError       error
 	Enabled           bool   `json:"enabled"`
 	Mode              string `json:"mode"`       // closed|freeform
 	ProfileID         int64  `json:"profile_id"` // 0 = follow active/default
@@ -379,7 +381,11 @@ type JudgeConfig struct {
 // judgeConfig reads the judge configuration from settings, applying defaults for
 // missing/invalid keys. Read fresh on each fallback judgement — the LLM call that
 // follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
-func (i *Interceptor) judgeConfig() JudgeConfig {
+func (i *Interceptor) judgeConfig(resolveProfile ...bool) JudgeConfig {
+	return i.judgeConfigFor(context.Background(), resolveProfile...)
+}
+
+func (i *Interceptor) judgeConfigFor(ctx context.Context, resolveProfile ...bool) JudgeConfig {
 	if i.db == nil {
 		return JudgeConfig{
 			Mode:              JudgeModeClosed,
@@ -390,14 +396,42 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 			AskTimeoutAction:  defaultJudgeAskTimeoutAction,
 		}
 	}
+	profileID := int64(i.getSettingInt(settingJudgeProfileID, 0))
+	var profile *db.LLMProfile
+	if profileID == 0 {
+		profile, _ = i.db.ActiveProfile()
+	} else {
+		profile, _ = i.db.ProfileByID(profileID)
+	}
+	native := profile != nil && profile.Format == "ollama"
+	var preferred *ProviderOrigin
+	var originError error
+	if profileID == 0 {
+		origin := providerOrigin(ctx)
+		originError = origin.Err
+		if origin.Native {
+			profileID, native = origin.ProfileID, true
+			profile = nil
+			preferred = &origin
+		}
+	}
+	timeoutDefault, failDefault := defaultJudgeTimeoutSecs, defaultJudgeFailAction
+	if native {
+		timeoutDefault, failDefault = 90, "ask"
+	}
 	c := JudgeConfig{
+		preferredOrigin:   preferred,
+		originError:       originError,
 		Enabled:           i.db.GetBool(settingJudgeEnabled, false),
 		Mode:              i.getSettingChoice(settingJudgeMode, JudgeModeClosed, JudgeModeClosed, JudgeModeFreeform),
-		ProfileID:         int64(i.getSettingInt(settingJudgeProfileID, 0)),
-		TimeoutSeconds:    i.getSettingInt(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
-		FailAction:        i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
+		ProfileID:         profileID,
+		TimeoutSeconds:    i.getSettingInt(settingJudgeTimeoutSecs, timeoutDefault),
+		FailAction:        i.getSettingChoice(settingJudgeFailAction, failDefault, "allow", "ask", "deny"),
 		AskTimeoutSeconds: i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
+	}
+	if len(resolveProfile) > 0 && resolveProfile[0] && profile != nil {
+		c.ProfileID = profile.ID
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -406,7 +440,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		c.Prompt = DefaultJudgePrompt
 	}
 	if c.TimeoutSeconds <= 0 {
-		c.TimeoutSeconds = defaultJudgeTimeoutSecs
+		c.TimeoutSeconds = timeoutDefault
 	}
 	if c.AskTimeoutSeconds <= 0 {
 		c.AskTimeoutSeconds = defaultJudgeAskTimeoutSecs
@@ -490,7 +524,12 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 // Ask verdicts carry the human-approval timeout so the existing HandleAsk
 // consumes them unchanged.
 func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool) {
-	cfg := i.judgeConfig()
+	// Resolve the selection and defaults from one settings/origin snapshot before
+	// starting the deadline. A later settings edit affects the next decision.
+	cfg := i.judgeConfigFor(ctx, true)
+	if cfg.preferredOrigin != nil {
+		ctx = context.WithValue(ctx, reviewOriginKey{}, *cfg.preferredOrigin)
+	}
 	i.mu.RLock()
 	rv, cp := i.reviewer, i.completer
 	i.mu.RUnlock()
@@ -518,6 +557,11 @@ func judgeWith(ctx context.Context, cfg JudgeConfig, rv Reviewer, cp Completer, 
 	if !closed {
 		input, contextErr = BuildReviewInput(cctx, tool, arguments)
 	}
+	if cfg.originError != nil {
+		cp = func(context.Context, int64, string, string) (string, int64, error) {
+			return "", cfg.ProfileID, cfg.originError
+		}
+	}
 	policy := cfg.Prompt // closed mode: the stored prompt is the operator policy (data)
 	cfg.Prompt = EffectiveJudgePrompt(cfg.Prompt)
 	var out Decision
@@ -533,7 +577,11 @@ func judgeWith(ctx context.Context, cfg JudgeConfig, rv Reviewer, cp Completer, 
 		out = Decision{Action: "ask", ModelFallback: true, Message: "Review context incomplete, human confirmation required: " + contextErr.Error()}
 	default:
 		modelInput, _ = json.Marshal(input)
-		out, err = rv(cctx, cfg.ProfileID, cfg.Prompt, input)
+		if cfg.originError != nil {
+			err = cfg.originError
+		} else {
+			out, err = rv(cctx, cfg.ProfileID, cfg.Prompt, input)
+		}
 	}
 	if err != nil {
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "Model review failed, handled per failure policy: " + err.Error()}

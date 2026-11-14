@@ -944,6 +944,10 @@ export interface Settings {
   // Per-profile cap on simultaneous in-flight LLM requests; 0 = unlimited.
   // Each profile's provider gets its own semaphore, shared across its agents.
   llm_max_concurrent?: number;
+  // Opt-in zero-egress policy for LLM HTTP only; defaults to false. An environment true cannot be disabled here.
+  local_llm_only?: boolean;
+  // CIDRs trusted in addition to loopback while local_llm_only is on; LAN/Docker hosts need an entry.
+  local_llm_allowed_cidrs?: string[];
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
@@ -1045,11 +1049,13 @@ export interface NotificationDelivery {
 export interface LLMProfile {
   id: string;
   name: string;
-  format: "openai" | "anthropic" | "openai-responses";
+  format: "openai" | "anthropic" | "openai-responses" | "ollama";
   base_url?: string;
   proxy?: string;
   model: string;
   api_key_hint?: string;
+  // True for native Ollama and verified local compatible endpoints; absent on older servers.
+  api_key_optional?: boolean;
   rate_per_second: number;
   rate_per_minute: number;
   context_window_k?: number;
@@ -1082,6 +1088,10 @@ export interface LLMProfile {
   user_agent?: string;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
+  // Ollama model residency sent as keep_alive (e.g. 30m); empty uses the backend default.
+  keep_alive?: string;
+  // Per-profile in-flight request cap; 0 inherits the global setting (Ollama: one per endpoint).
+  llm_max_concurrent?: number;
 }
 
 // ---- LLM 重试策略 ----
@@ -1098,6 +1108,39 @@ export interface LLMRetryOverride {
   connect: LLMRetryRule; // 建连重试：连接重置/超时/429/5xx，流开始前
   empty: LLMRetryRule; // 空响应重试：完成但没有任何内容（仅 openai 格式）
   stream: LLMRetryRule; // 同 provider 安全窗口重试：未交付输出前的断流重放
+}
+
+export interface LLMTestResult {
+  ok: boolean;
+  error?: string;
+  latency_ms?: number;
+  model?: string;
+  reply?: string;
+  load_duration_ms?: number;
+  tokens_per_second?: number;
+  context_length?: number;
+  context_verified?: boolean;
+  capabilities?: string[];
+  tools_supported?: boolean;
+  tool_call_verified?: boolean;
+  // /api/ps memory estimate for the selected runner; omitted when unknown. Not exact weights or GPU capacity.
+  size_bytes?: number;
+  size_vram_bytes?: number;
+  gpu_offload_percent?: number;
+  // Other models resident on the same Ollama server.
+  other_loaded_models?: string[];
+  // The explicitly configured judge uses a different model or context on this endpoint.
+  judge_model_mismatch?: boolean;
+}
+
+// POST /api/llm/models model_details item (native Ollama only). error means /api/show failed,
+// so capabilities are unknown rather than absent.
+export interface LLMModelDetail {
+  model?: string;
+  name?: string;
+  details?: { parameter_size?: string; quantization_level?: string; family?: string };
+  capabilities?: string[];
+  error?: string;
 }
 
 // 全局策略 = 上面三层的默认值 + 两层只有全局的：
@@ -1628,6 +1671,8 @@ export interface UpdateCheck {
   rolled_back?: boolean;
   /** 查询 GitHub 失败时给出原因，此时下面的字段都不会有。 */
   error?: string;
+  /** True when local_llm_only blocked the check; error then carries the policy message, not a network failure. */
+  local_llm_only?: boolean;
   latest?: string;
   notes?: string;
   html_url?: string;
