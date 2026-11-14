@@ -139,7 +139,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - Thêm bộ preset Cloud Economy (DeepSeek, Claude Haiku, OpenAI Responses, Qwen, Kimi, OpenRouter, Z.ai GLM-5.3) và hạch toán chi tiết token cache read/write + reasoning (`#27`).
   - **File chính**: `ollama/`, `llmnet/`, `agent/provider.go`, `llmpool/`, `server/llm_*.go`, `web/src/app/(main)/system/llm/page.tsx`.
 
-- [ ] **4.3. Sổ cái Chi phí EUR (`Cost Ledger`) & Xoay vòng LLM theo Intent (`BaaRai #71, #74, #111, #114`)**
+- [x] **4.3. Sổ cái Chi phí EUR (`Cost Ledger`) & Xoay vòng LLM theo Intent (`BaaRai #71, #74, #111, #114`)**
   - **Mô tả**: Cấu hình đơn giá token theo từng LLM profile để tính chi phí thực tế (`cost_eur`) cho mỗi task/lần gọi; hỗ trợ xoay vòng profile theo từng intent (`llm_rotate`) và tự động leo thang sang profile kế tiếp khi lỗi liên tiếp; thêm thẻ tổng kết Task Outcome Card (`#102`).
   - **File chính**: `db/llm_usage.go`, `llmpool/`, `server/cost_ledger_test.go`, `server/engine.go`, `web/src/app/(main)/function/tasks/detail/`.
 

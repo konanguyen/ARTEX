@@ -17,6 +17,92 @@ import (
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
 // findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
 // built from the exploration edges in graph_overview.
+// normalizeDirection fingerprints an intent summary for stagnation detection:
+// case-folded, all digits collapsed to '#', whitespace collapsed. Two intents
+// aimed at the same thing with different IDs/counts/URLs fingerprint the same.
+func normalizeDirection(summary string) string {
+	var b strings.Builder
+	digit := false
+	for _, r := range strings.ToLower(strings.Join(strings.Fields(summary), " ")) {
+		if r >= '0' && r <= '9' {
+			if !digit {
+				b.WriteByte('#')
+			}
+			digit = true
+			continue
+		}
+		digit = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// detectStagnation (ouroboros take, #99) flags directions whose normalized
+// summary repeats stagnationMinRepeats times among finished intents while no
+// finding has been produced since the FIRST attempt at that direction: the
+// planner is grinding the same shape of work without yield. Pure function over
+// (finished intents, findings) so it is unit-testable without a store.
+const stagnationMinRepeats = 3
+
+func detectStagnation(done, findings []*db.Node) []map[string]any {
+	type dir struct {
+		firstID int64
+		repeats int
+		summary string
+	}
+	dirs := map[string]*dir{}
+	order := []string{}
+	for _, n := range done {
+		var payload map[string]any
+		_ = json.Unmarshal(n.Payload, &payload)
+		summ, _ := payload["summary"].(string)
+		if strings.TrimSpace(summ) == "" {
+			continue
+		}
+		fp := normalizeDirection(summ)
+		if fp == "" {
+			continue
+		}
+		d, ok := dirs[fp]
+		if !ok {
+			d = &dir{firstID: n.ID, summary: summ}
+			dirs[fp] = d
+			order = append(order, fp)
+		}
+		if n.ID < d.firstID {
+			d.firstID = n.ID
+			d.summary = summ
+		}
+		d.repeats++
+	}
+	var out []map[string]any
+	for _, fp := range order {
+		d := dirs[fp]
+		if d.repeats < stagnationMinRepeats {
+			continue
+		}
+		produced := false
+		for _, f := range findings {
+			if f.ID > d.firstID {
+				produced = true
+				break
+			}
+		}
+		if produced {
+			continue
+		}
+		out = append(out, map[string]any{
+			"direction": d.summary,
+			"repeats":   d.repeats,
+			"since":     d.firstID,
+		})
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return out
+}
+
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
@@ -453,6 +539,15 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
 	out["findings_total"] = len(vulnNodes)             // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
 	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
+	// Stagnation surfacing (#99): repeated finished directions with no findings
+	// since their first attempt. Self-describing payload — the instruction ships
+	// with the data so no prompt-template change is needed on deployed installs.
+	if stale := detectStagnation(recentDone, vulnNodes); len(stale) > 0 {
+		out["stagnation_warning"] = map[string]any{
+			"directions":  stale,
+			"instruction": "these directions were dispatched repeatedly with zero findings produced since their first attempt — do NOT re-dispatch the same approach again; open a materially different direction, or judge the goal on the existing evidence instead of grinding",
+		}
+	}
 	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
 	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。

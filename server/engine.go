@@ -1031,6 +1031,14 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // while the worker is busy, and every intent state write below is fenced on it,
 // so a worker whose claim was taken over cannot overwrite the new claimer.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, token, requestID, message string) bool {
+	// Per-intent LLM rotation (#85): each claimed worker intent runs on the
+	// next chain head. The pin travels through the run context into the
+	// provider resolver; non-worker roles and failover keep the active head.
+	if t.LLMRotate {
+		if head, ok := t.nextRotatedProfile(); ok {
+			ctx = withLLMProfilePin(ctx, head)
+		}
+	}
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)

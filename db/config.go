@@ -66,6 +66,12 @@ type LLMProfile struct {
 	// request built from this profile. "" = don't override (keep the default UA);
 	// old profiles behave exactly as before. Maps to agent.Config.UserAgent.
 	UserAgent string `json:"user_agent"`
+	// Cost ledger: EUR per 1M tokens (0 = unset; cost is computed only when a
+	// price is set). Set through the same profile API/SaveProfile path.
+	PriceInputPerM      float64 `json:"price_input_per_m,omitempty"`
+	PriceOutputPerM     float64 `json:"price_output_per_m,omitempty"`
+	PriceCacheReadPerM  float64 `json:"price_cache_read_per_m,omitempty"`
+	PriceCacheWritePerM float64 `json:"price_cache_write_per_m,omitempty"`
 	// Retry overrides this profile's share of the retry ladder. Zero value =
 	// inherit the global policy (LLMRetryPolicy), so an untouched profile behaves
 	// exactly as before. See RetryOverride.
@@ -85,8 +91,8 @@ type RetryOverride struct {
 // profileCols is the read column list (hint variant, no api key) shared by the
 // list query; profileColsKey is the same with api_key for the single-row loads.
 const profileRetryCols = `COALESCE(retry_connect_attempts,0),COALESCE(retry_connect_interval_ms,0),COALESCE(retry_empty_attempts,0),COALESCE(retry_empty_interval_ms,0),COALESCE(retry_stream_attempts,0),COALESCE(retry_stream_interval_ms,0)`
-const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(user_agent,'')`
-const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(user_agent,'')`
+const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(user_agent,''),COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0)`
+const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(user_agent,''),COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0)`
 
 // scanProfile reads one row in the profileCols / profileColsKey column order. The
 // 7th column lands in APIKeyHint or APIKey depending on which list the caller used.
@@ -97,7 +103,8 @@ func scanProfile(sc interface{ Scan(...any) error }, into *string, p *LLMProfile
 		&p.Retry.Connect.Attempts, &p.Retry.Connect.IntervalMS,
 		&p.Retry.Empty.Attempts, &p.Retry.Empty.IntervalMS,
 		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS,
-		&p.UserAgent)
+		&p.UserAgent,
+		&p.PriceInputPerM, &p.PriceOutputPerM, &p.PriceCacheReadPerM, &p.PriceCacheWritePerM)
 	if err != nil {
 		return err
 	}
@@ -192,18 +199,34 @@ func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING id`,
 			p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, ua).Scan(&id)
+		if err == nil {
+			_, err = d.saveProfilePrices(id, p)
+		}
 		return id, err
 	}
 	if p.APIKey == "" {
 		_, err := d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,rate_per_second=$6,rate_per_minute=$7,context_window_k=$8,reasoning_effort=$9,priority=$10,pool_exclude=$11,thinking_type=$12,streaming=$13,max_tokens=$14,max_tokens_field=$15,session_header_key=$16,retry_connect_attempts=$17,retry_connect_interval_ms=$18,retry_empty_attempts=$19,retry_empty_interval_ms=$20,retry_stream_attempts=$21,retry_stream_interval_ms=$22,user_agent=$23 WHERE id=$24`,
 			p.Name, p.Format, p.BaseURL, proxy, p.Model, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, ua, p.ID)
+		if err == nil {
+			_, err = d.saveProfilePrices(p.ID, p)
+		}
 		return p.ID, err
 	}
 	_, err = d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,api_key=$6,api_key_hint=$7,rate_per_second=$8,rate_per_minute=$9,context_window_k=$10,reasoning_effort=$11,priority=$12,pool_exclude=$13,thinking_type=$14,streaming=$15,max_tokens=$16,max_tokens_field=$17,session_header_key=$18,retry_connect_attempts=$19,retry_connect_interval_ms=$20,retry_empty_attempts=$21,retry_empty_interval_ms=$22,retry_stream_attempts=$23,retry_stream_interval_ms=$24,user_agent=$25 WHERE id=$26`,
 		p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
 		r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, ua, p.ID)
+	if err == nil {
+		_, err = d.saveProfilePrices(p.ID, p)
+	}
 	return p.ID, err
+}
+
+// saveProfilePrices writes the cost-ledger columns (kept out of the three main
+// statements so the pricing surface stays one small, auditable write).
+func (d *DB) saveProfilePrices(id int64, p *LLMProfile) (sql.Result, error) {
+	return d.Exec(`UPDATE llm_profiles SET price_input_per_m=($1),price_output_per_m=($2),price_cache_read_per_m=($3),price_cache_write_per_m=($4) WHERE id=$5`,
+		p.PriceInputPerM, p.PriceOutputPerM, p.PriceCacheReadPerM, p.PriceCacheWritePerM, id)
 }
 
 var (

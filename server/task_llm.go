@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -85,6 +86,54 @@ func isQuotaExhaustedError(err error) bool {
 	return err != nil && agent.IsQuotaExhaustedMessage(err.Error())
 }
 
+// Consecutive-failure escalation (ouroboros cost-tier take, #99): quota
+// exhaustion already advances the chain, but a profile that keeps failing with
+// plain runtime errors (bad key, persistent 5xx, broken model output) would
+// otherwise burn the whole same-provider retry budget on every call. After
+// llmFailStreakThreshold consecutive failed calls on the same chain profile
+// the chain advances exactly like a quota exhaust, carrying the true reason.
+// Deliberately escalation-only: no auto-downgrade (a mid-task model swap-down
+// risks behavior drift and flapping; the operator can reset the chain).
+const llmFailStreakThreshold = 3
+
+var llmFailStreaks = struct {
+	sync.Mutex
+	m map[string]int
+}{m: map[string]int{}}
+
+func llmFailKey(taskID string, profileID int64) string {
+	return taskID + ":" + strconv.FormatInt(profileID, 10)
+}
+
+// noteLLMCallFailure records one failed call on (task, profile) and reports
+// whether the escalation threshold was just reached. The streak resets when it
+// fires and on every success, so the counter tracks consecutive failures only.
+func noteLLMCallFailure(taskID string, profileID int64) bool {
+	llmFailStreaks.Lock()
+	defer llmFailStreaks.Unlock()
+	k := llmFailKey(taskID, profileID)
+	llmFailStreaks.m[k]++
+	if llmFailStreaks.m[k] >= llmFailStreakThreshold {
+		delete(llmFailStreaks.m, k) // armed and consumed — next failure starts a fresh streak
+		return true
+	}
+	return false
+}
+
+// resetLLMFailStreaksForTest clears every streak; test isolation only (the
+// escalation counter is package-global in-memory state).
+func resetLLMFailStreaksForTest() {
+	llmFailStreaks.Lock()
+	llmFailStreaks.m = map[string]int{}
+	llmFailStreaks.Unlock()
+}
+
+func resetLLMFailStreak(taskID string, profileID int64) {
+	llmFailStreaks.Lock()
+	defer llmFailStreaks.Unlock()
+	delete(llmFailStreaks.m, llmFailKey(taskID, profileID))
+}
+
 type taskLLMSelection struct {
 	task      *Task
 	profileID int64
@@ -95,8 +144,25 @@ type taskLLMSelection struct {
 	retry agent.RetryConfig
 }
 
+// llmProfilePin carries a per-run chain-head override through the call stack
+// (#85 per-intent rotation). The engine sets it when launching a worker run;
+// resolution stays within the task's chain and never bypasses failover state.
+type llmProfilePinKey struct{}
+
+func withLLMProfilePin(ctx context.Context, profileID int64) context.Context {
+	return context.WithValue(ctx, llmProfilePinKey{}, profileID)
+}
+
+func llmProfilePinFrom(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	id, ok := ctx.Value(llmProfilePinKey{}).(int64)
+	return id, ok
+}
+
 type taskLLMStreamHooks struct {
-	current    func() (taskLLMSelection, error)
+	current    func(context.Context) (taskLLMSelection, error)
 	exhaust    func(taskLLMSelection, error) (db.TaskLLMTransition, error)
 	transition func(taskLLMSelection, db.TaskLLMTransition, error)
 }
@@ -108,6 +174,14 @@ type taskLLMStreamHooks struct {
 // 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
 // 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
 func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
+	return r.currentFor(context.Background())
+}
+
+// currentFor resolves like current, honoring a per-run profile pin set by the
+// engine for per-intent rotation (#85). A pin is only a dispatch preference:
+// the chain must still be in a ready state (an exhausted chain with no active
+// head stays exhausted) and the pinned id must belong to the task's chain.
+func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, error) {
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
 		return taskLLMSelection{}, err
@@ -131,6 +205,14 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
+		if pin, ok := llmProfilePinFrom(ctx); ok && pin != sel.profileID {
+			for _, id := range pt.LLMProfileIDs {
+				if id == pin {
+					sel.profileID = pin
+					break
+				}
+			}
+		}
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
@@ -201,7 +283,7 @@ func parseTaskID(id string) (int64, error) {
 // exhausted, and how to emit a failover transition.
 func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 	return taskLLMStreamHooks{
-		current: r.current,
+		current: func(ctx context.Context) (taskLLMSelection, error) { return r.currentFor(ctx) },
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
 			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
@@ -236,7 +318,7 @@ func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {
 	for {
-		selection, err := hooks.current()
+		selection, err := hooks.current(ctx)
 		if err != nil {
 			return llm.Message{}, "", llm.Usage{}, err
 		}
@@ -264,7 +346,27 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			break
 		}
 		if callErr == nil {
+			resetLLMFailStreak(taskID, selection.profileID)
 			return msg, sr, usage, nil
+		}
+		// Non-quota failures on a chain profile escalate after a consecutive
+		// streak (#99): same advance path as quota exhaust, truthful reason.
+		if selection.profileID != 0 && !isQuotaExhaustedError(callErr) && ctx.Err() == nil {
+			if noteLLMCallFailure(taskID, selection.profileID) {
+				cause := fmt.Errorf("profile #%d failed %d consecutive calls (last: %w)", selection.profileID, llmFailStreakThreshold, callErr)
+				transition, markErr := hooks.exhaust(selection, cause)
+				if markErr != nil {
+					return llm.Message{}, "", llm.Usage{}, fmt.Errorf("mark profile exhausted after %v: %w", callErr, markErr)
+				}
+				if transition.Advanced && !transition.Stale && hooks.transition != nil {
+					hooks.transition(selection, transition, callErr)
+				}
+				if !transition.Stale && transition.NextProfileID == nil {
+					return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
+				}
+				continue // replay the same logical request on the next profile
+			}
+			return llm.Message{}, "", llm.Usage{}, callErr
 		}
 		// profileID=0: 显式链已被清空;非额度错误:透传。二者都不改任务 failover 状态。
 		if selection.profileID == 0 || !isQuotaExhaustedError(callErr) {
@@ -287,7 +389,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) iter.Seq2[llm.StreamEvent, error] {
 	return func(yield func(llm.StreamEvent, error) bool) {
 		for {
-			selection, err := hooks.current()
+			selection, err := hooks.current(ctx)
 			if err != nil {
 				yield(llm.StreamEvent{}, err)
 				return
@@ -338,12 +440,35 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				break
 			}
 			if streamErr == nil {
+				resetLLMFailStreak(taskID, selection.profileID)
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return
 					}
 				}
 				return
+			}
+			// Non-quota failures on a chain profile escalate after a consecutive
+			// streak (#99), mirroring completeTaskLLM. Escalation only applies to
+			// uncommitted streams: once events reached the caller, replaying on a
+			// new profile could duplicate delivered output, so the error surfaces.
+			if selection.profileID != 0 && !committed && !isQuotaExhaustedError(streamErr) && ctx.Err() == nil {
+				if noteLLMCallFailure(taskID, selection.profileID) {
+					cause := fmt.Errorf("profile #%d failed %d consecutive calls (last: %w)", selection.profileID, llmFailStreakThreshold, streamErr)
+					transition, markErr := hooks.exhaust(selection, cause)
+					if markErr != nil {
+						yield(llm.StreamEvent{}, fmt.Errorf("mark profile exhausted after %v: %w", streamErr, markErr))
+						return
+					}
+					if transition.Advanced && !transition.Stale && hooks.transition != nil {
+						hooks.transition(selection, transition, streamErr)
+					}
+					if !transition.Stale && transition.NextProfileID == nil {
+						yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: streamErr})
+						return
+					}
+					continue // nothing delivered — safe to replay on the next profile
+				}
 			}
 			// profileID=0 means the explicit chain was cleared while this stable task
 			// bundle was still in use. Agent/global fallback errors follow the legacy

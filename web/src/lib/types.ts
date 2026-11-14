@@ -33,6 +33,7 @@ export interface Task {
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain
   active_llm_profile_id?: number; // profile used by the next LLM call
+  llm_rotate?: boolean; // per-intent round-robin over task LLM chain heads (#85)
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
@@ -828,6 +829,8 @@ export interface ProfileUsage {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  // EUR cost from the profile's stored prices; absent when the profile has no price set.
+  cost_eur?: number | null;
 }
 
 // One (profile, UTC day) token bucket for the dashboard's daily chart (new source).
@@ -1061,6 +1064,11 @@ export interface LLMProfile {
   pool_exclude?: boolean;
   // true（默认）= 流式(SSE) | false = 真·非流式(stream:false，一次性返回)。
   streaming?: boolean;
+  // Cost ledger: EUR per 1M tokens (0/absent = unset).
+  price_input_per_m?: number;
+  price_output_per_m?: number;
+  price_cache_read_per_m?: number;
+  price_cache_write_per_m?: number;
   // 单次回复的输出上限(token)。0 = 不发送该字段，由服务端默认值决定。
   // 注意与 context_window_k 区分：后者是模型总容量，只在本地用于压缩阈值。
   max_tokens?: number;

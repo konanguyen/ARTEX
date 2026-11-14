@@ -534,6 +534,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL,
     active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL,
     llm_chain_revision BIGINT NOT NULL DEFAULT 0,
+    llm_rotate     BOOLEAN NOT NULL DEFAULT false,
     company_id     BIGINT REFERENCES companies(id) ON DELETE SET NULL,
     parent_ref     TEXT,
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
@@ -555,6 +556,7 @@ CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- planner 心跳触发间隔(秒);补旧库。默认 300s(5min)。见 docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_rotate BOOLEAN NOT NULL DEFAULT false;
 -- 并发上限挂起态;补旧库。true=因并发上限排队、等待空位自动启动。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false;
 -- 资产覆盖度功能开关;补旧库。true(默认)=计算/展示测试覆盖度、自动累积测试范围、
@@ -1443,3 +1445,10 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- Cost ledger (#70): optional per-profile pricing, EUR per 1M tokens. NULL/0 = unset;
+-- usage aggregations compute cost only when at least one price is set.
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_input_per_m NUMERIC(12,6);
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_output_per_m NUMERIC(12,6);
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_read_per_m NUMERIC(12,6);
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_write_per_m NUMERIC(12,6);

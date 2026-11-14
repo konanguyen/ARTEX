@@ -55,6 +55,7 @@ type TaskDTO struct {
 	LLMProfileID       *int64             `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
 	LLMProfileIDs      []int64            `json:"llm_profile_ids"`
 	ActiveLLMProfileID *int64             `json:"active_llm_profile_id,omitempty"`
+	LLMRotate          bool               `json:"llm_rotate"`
 	LLMFailoverState   string             `json:"llm_failover_state"`
 	LLMFailoverReason  string             `json:"llm_failover_reason,omitempty"`
 	SourceTaskIDs      []string           `json:"source_task_ids"`
@@ -129,6 +130,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		LLMProfileID:       llmState.ProfileID,
 		LLMProfileIDs:      profileIDs,
 		ActiveLLMProfileID: llmState.ActiveID,
+		LLMRotate:          t.LLMRotate,
 		LLMFailoverState:   llmState.FailoverState,
 		LLMFailoverReason:  llmState.FailoverReason,
 		SourceTaskIDs:      sourceIDs,
@@ -620,8 +622,12 @@ type LLMProfileDTO struct {
 	MaxTokensField string `json:"max_tokens_field"`
 	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
 	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
-	SessionHeaderKey string `json:"session_header_key"`
-	UserAgent        string `json:"user_agent"`
+	SessionHeaderKey    string  `json:"session_header_key"`
+	UserAgent           string  `json:"user_agent"`
+	PriceInputPerM      float64 `json:"price_input_per_m,omitempty"`
+	PriceOutputPerM     float64 `json:"price_output_per_m,omitempty"`
+	PriceCacheReadPerM  float64 `json:"price_cache_read_per_m,omitempty"`
+	PriceCacheWritePerM float64 `json:"price_cache_write_per_m,omitempty"`
 	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
@@ -630,28 +636,32 @@ type LLMProfileDTO struct {
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 	return LLMProfileDTO{
-		ID:               i64s(p.ID),
-		Name:             p.Name,
-		Format:           p.Format,
-		BaseURL:          p.BaseURL,
-		Proxy:            maskedSecret(p.Proxy),
-		ProxySet:         p.Proxy != "",
-		Model:            p.Model,
-		APIKeyHint:       p.APIKeyHint,
-		RatePerSecond:    p.RatePerSecond,
-		RatePerMinute:    p.RatePerMinute,
-		ContextWindowK:   p.ContextWindowK,
-		ThinkingType:     p.ThinkingType,
-		ReasoningEffort:  p.ReasoningEffort,
-		IsDefault:        p.IsDefault,
-		Priority:         p.Priority,
-		PoolExclude:      p.PoolExclude,
-		Streaming:        p.Streaming,
-		MaxTokens:        p.MaxTokens,
-		MaxTokensField:   p.MaxTokensField,
-		SessionHeaderKey: p.SessionHeaderKey,
-		UserAgent:        p.UserAgent,
-		Retry:            p.Retry,
+		ID:                  i64s(p.ID),
+		Name:                p.Name,
+		Format:              p.Format,
+		BaseURL:             p.BaseURL,
+		Proxy:               maskedSecret(p.Proxy),
+		ProxySet:            p.Proxy != "",
+		Model:               p.Model,
+		APIKeyHint:          p.APIKeyHint,
+		RatePerSecond:       p.RatePerSecond,
+		RatePerMinute:       p.RatePerMinute,
+		ContextWindowK:      p.ContextWindowK,
+		ThinkingType:        p.ThinkingType,
+		ReasoningEffort:     p.ReasoningEffort,
+		IsDefault:           p.IsDefault,
+		Priority:            p.Priority,
+		PoolExclude:         p.PoolExclude,
+		Streaming:           p.Streaming,
+		MaxTokens:           p.MaxTokens,
+		MaxTokensField:      p.MaxTokensField,
+		SessionHeaderKey:    p.SessionHeaderKey,
+		UserAgent:           p.UserAgent,
+		PriceInputPerM:      p.PriceInputPerM,
+		PriceOutputPerM:     p.PriceOutputPerM,
+		PriceCacheReadPerM:  p.PriceCacheReadPerM,
+		PriceCacheWritePerM: p.PriceCacheWritePerM,
+		Retry:               p.Retry,
 	}
 }
 
