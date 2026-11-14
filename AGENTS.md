@@ -31,6 +31,11 @@
 - Local browser E2E test scripts are located in `tests/` (`verify_all_pages_browser.js`, `test_browser_smoke.js`, `check_chinese_dom.js`, `run_tests.sh`).
 - Keep `/tests/` in `.gitignore` to prevent committing local test credentials, run logs, or ad-hoc scripts.
 
+## Changelog
+- `CHANGELOG.md` must be updated with every release tag and, for feature batches, with each feature commit or batch before it ships. This has been forgotten repeatedly — updating it is part of the definition of done, not an afterthought.
+- **Language rule**: entries up to and including `0.3.15` were written in Simplified Chinese and stay that way for history. Every new entry (from `0.4.0` onward) is written in English — do not write new entries in Chinese to match the old style, and do not rewrite the historical Chinese sections.
+- Follow the existing Keep a Changelog structure (Added / Security / Reliability / Fixed / CI subsections under the version heading, newest version first, `## [Unreleased]` at the top).
+
 ## Git and communication
 - Test and commit each feature or fix immediately upon completion (one clean, verified commit per feature/task; do not batch multiple features into a single commit or leave completed features uncommitted).
 - Commit messages must be written in English and include a clear subject plus a concise body describing the change and relevant behavior/validation; do not use a subject-only commit.

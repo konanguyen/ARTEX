@@ -1,42 +1,84 @@
-# 更新日志
+# Changelog
 
-本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+Important changes to this project are recorded in this file, following
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+> **Language note**: entries up to and including 0.3.15 were written in Simplified
+> Chinese and are kept as-is for history. From 0.4.0 onward every new entry is
+> written in English (see AGENTS.md, "Changelog").
 
 ## [Unreleased]
 
 ## [0.4.0] - 2026-11-15
 
-### 平台集成（PLAN 阶段 1–6 全量落地）
+### Platform integration (PLAN phases 1-6 fully landed)
 
-#### 新增的功能
+#### Added
 
-- **资产目标审批门（Target Gate）**：每个任务/会话可单独开启。开启后，工具调用声明的目标地址逐一经解析器核对，未覆盖的目标发起人工审批请求（`target_pins`，按任务/会话钉住可撤销）；WebFetch、自定义 http 工具与 enrich 探测的每一跳重定向与每一次实际连接都经 `RedirectCheck`/`PinnedDialer` 复核，域名解析变化无法绕过已批准的地址。
-- **Agentic 提示注入防线**：工具输出默认用随机 nonce 标记框定为数据（`ARTEX_UNTRUSTED_BOUNDARY=0` 关闭）；规划者/压缩器追加 code-owned 不可信数据规则与目标锚；agent 派生字段（worker 输出、finding 详情、非操作者 hint、事实、摘要）按每条消息随机 nonce 封框；hint 记录来源，agent 写的 hint 不会被当作操作者指令。
-- **目标证明收紧**：`prove_goal` 只接受 confidence=observed 且来源不是 target_response 的事实；`goal_met` 在仍有未证目标时拒绝；内置 deny 规则同样作用于 planner 与主 agent。
-- **扫描结果摄取**：`ingest_scan_output` 新增 subdive-json 格式（配合预装的本仓库 subdive v1.0.0 深度子域枚举工具，含 SecLists 20k 词表，无需 venv），nmap XML、nuclei、httpx、ffuf 之外再添一路：每解析名一条 subdomain 资产 + 一条带指纹溯源的事实。
-- **外部控制适配器**：`adapters/agent/` 提供 stdio MCP server（Claude Code / Codex）与 Pi 扩展，八只只读为主、写操作需显式开启的工具，经已认证 HTTP API 驱动平台。
-- **Recon 工具箱进镜像**：nuclei / httpx / subfinder / katana / ffuf / dalfox / sqlmap 全部钉住版本并以各自 release 的 SHA256 校验下载；bbot venv 预装；新增本仓库 skills（php2shell、codeaudit、api-security、edr-bypass-re、patch-diff、rea、subdive-recon）。
-- **备份脚本**：`scripts/backup.sh` 在 postgres 容器内 pg_dump，支持轮转与可选 data 归档。
+- **Asset target approval gate (Target Gate)**: opt-in per task/conversation. Tool-call
+  targets are resolved and checked against approved pins (`target_pins`, per task or
+  conversation, revocable); every redirect hop of WebFetch, the custom http tool and the
+  enrich probe, and every actual connection they make, is re-checked through
+  `RedirectCheck`/`PinnedDialer`, so DNS changes cannot bypass an approved address.
+- **Agentic prompt-injection defenses**: tool output is framed as data between
+  nonce-tagged markers by default (`ARTEX_UNTRUSTED_BOUNDARY=0` disables); the planner
+  and compactor get code-owned untrusted-data rules and a goal anchor; agent-derived
+  fields (worker output, finding details, non-operator hints, facts, digests) are framed
+  in per-message nonce envelopes; hints record their writer, so an agent-written hint is
+  never mistaken for an operator instruction.
+- **Tighter goal proof**: `prove_goal` accepts only facts with confidence=observed whose
+  source is not target_response; `goal_met` refuses while goal nodes are open; the
+  built-in deny rules now apply to the planner and the main agent as well.
+- **Scan ingestion**: `ingest_scan_output` gains the subdive-json format (paired with
+  this repo's preinstalled subdive v1.0.0 deep subdomain enumerator, SecLists 20k
+  wordlist baked in, no venv needed) alongside nmap XML, nuclei, httpx and ffuf: one
+  subdomain asset per resolved name plus one provenance-carrying fact.
+- **External control adapter**: `adapters/agent/` ships a stdio MCP server (Claude Code /
+  Codex) and a Pi extension with eight tools, read-only by default, writes opt-in,
+  driving the platform through the authenticated HTTP API.
+- **Recon toolbox in the image**: nuclei / httpx / subfinder / katana / ffuf / dalfox /
+  sqlmap all pinned and downloaded with SHA256 verification from their own releases;
+  bbot venv preinstalled; new skills (php2shell, codeaudit, api-security, edr-bypass-re,
+  patch-diff, rea, subdive-recon).
+- **Backup script**: `scripts/backup.sh` runs pg_dump inside the postgres container with
+  rotation and an optional data archive.
+- **External adapters' response size caps, timeouts and credential redaction** carry
+  over from the adapter port.
 
-#### 安全加固
+#### Security
 
-- **JWT 密钥与密码哈希绑定**（HMAC-SHA256）：任何密码变更（API、reset-password.sh、直接改库）立即作废此前签发的全部会话；跨进程改密在 2 秒缓存窗口内生效。
-- **CORS 收紧**：默认同源，跨域浏览器访问改为 `ARTEX_CORS_ORIGINS` 白名单（此前 `*`）。
-- **拦截规则读取失败改为失败安全**：主 gate 转人工确认，内置 deny 规则改为阻止调用——瞬时数据库故障不再静默放下整道拦截。
-- **URL 内嵌凭据不再入库**：资产 URL、扫描摄取与归档恢复统一剥离 userinfo。
+- **JWT signing keys bound to the password hash** (HMAC-SHA256): any password change —
+  API, reset-password.sh, or a direct DB edit — immediately invalidates every token
+  issued before it; out-of-process resets take effect within a 2-second cache window.
+- **CORS tightened**: same-origin by default; cross-origin browser access is now an
+  `ARTEX_CORS_ORIGINS` allowlist (previously `*`).
+- **Intercept rule reads fail safe**: the main gate routes to human confirmation and the
+  built-in deny floor blocks the call when the store cannot be read — a transient DB
+  error no longer silently lifts the whole interception layer.
+- **URL-embedded credentials never reach the database**: asset URLs, scan ingestion and
+  archive restores strip userinfo uniformly.
 
-#### 稳定性
+#### Reliability
 
-- **Agent 钩子并发守卫**：PromptOverride/ToolAugment/ToolResolve/wrap-up 覆盖钩子加锁，装配与运行不再竞态。
-- **系统提示词缓存**：无 deferred 块时也标记缓存边界（Anthropic 前缀缓存逐请求省 token）。
-- **工具名大小写漂移吸收**：CamelCase 内置工具自动注册小写/蛇形别名，模型误拼仍命中处理器。
-- **UTF-8 安全截断与进程树内存看门狗**（norma）：CJK 输出不再被按字节切碎；`NORMA_TASK_RSS_MB`（默认 4096）超限杀死失控进程组。
-- **Web**：报告加载失败可重试并不再与空报告混淆；SSE 被反代缓冲时主控台自动回退轮询；平板宽度侧栏自动收起；技能树键盘可操作。
+- **Guarded agent hooks**: PromptOverride/ToolAugment/ToolResolve and the wrap-up and
+  finding-traffic hooks are lock-guarded — server wiring can run while agents render
+  prompts or assemble tools.
+- **System prompt caching**: the cache boundary is reported even without a deferred-tools
+  block (Anthropic prefix caching saves the system prompt on every request).
+- **Tool-name case-drift aliases**: CamelCase built-ins register lowercase/snake aliases
+  so a drifted model spelling still reaches the handler.
+- **UTF-8-safe truncation and a per-task process-tree RSS watchdog** (norma): CJK output
+  is no longer cut mid-rune; `NORMA_TASK_RSS_MB` (default 4096) kills runaway process
+  groups.
+- **Web**: report load failures are distinct from an empty report and retryable; the
+  main-agent console falls back to polling when SSE is buffered or dropped; the sidebar
+  auto-collapses at tablet widths; the skills tree is keyboard-operable.
 
 ### CI
 
-- 新增 `ci.yml`：每次 push/PR 运行 Go 全量测试（Postgres service）与 web tsc/vitest/i18n key-parity 检查；`release.yml` 仍在 v* tag 触发五平台构建。
-
+- New `ci.yml`: Go build/vet/test against a PostgreSQL service plus web tsc/vitest and
+  the i18n key-parity guard on every push and PR; `release.yml` keeps building five
+  platforms on v* tags.
 
 ## [0.3.15] - 2026-10-07
 
