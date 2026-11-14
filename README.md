@@ -123,7 +123,7 @@ cp config.example.json config.json   # fill in the database connection
 # 1) Static export of the frontend
 cd web && npm ci && npm run build:static && cd ..
 # 2) Copy into the embed directory
-cp -r web/out server/webui/dist
+rm -rf server/webui/dist && mkdir -p server/webui/dist && cp -a web/out/. server/webui/dist/
 # 3) Build (-tags embedui embeds the frontend)
 CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 ./start.sh
@@ -201,7 +201,7 @@ cp -r <extracted>/skills ./ && cp <extracted>/artex ./
 ```bash
 git pull
 cd web && npm ci && npm run build:static && cd ..
-cp -r web/out server/webui/dist
+rm -rf server/webui/dist && mkdir -p server/webui/dist && cp -a web/out/. server/webui/dist/
 CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 # restart ./start.sh
 ```
