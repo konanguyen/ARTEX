@@ -176,13 +176,13 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
 
 ## Giai đoạn 6: Mở rộng Hệ sinh thái, Docker Recon Toolbox, Skills & Adapters
 
-- [ ] **6.1. Bổ sung bộ Skills mới & Đóng gói Recon Toolbox vào Docker (`BaaRai #55, #77, #112, #113, #118, #188`)**
+- [x] **6.1. Bổ sung bộ Skills mới & Đóng gói Recon Toolbox vào Docker (`BaaRai #55, #77, #112, #113, #118, #188`)**
   - **Mô tả**:
     - Port các skill mới vào `skills/`: `bbot-recon`, `php2shell`, `codeaudit`, `api-security`, `edr-bypass-re`, `patch-diff`, `rea`.
     - Cập nhật `Dockerfile` cài đặt sẵn và kiểm tra SHA256 checksum cho bộ công cụ recon (`nuclei`, `httpx`, `subfinder`, `katana`, `ffuf`, `dalfox`, `sqlmap` cố định commit) và nâng `Norma` lên `v0.4.8` (watchdog bộ nhớ tiến trình con, cắt chuỗi chuẩn UTF-8).
   - **File chính**: `skills/`, `Dockerfile`, `norma/`, `scripts/backup.sh`.
 
-- [ ] **6.2. Adapter điều khiển ngoài cho Claude Code / Codex / Pi & Cầu nối `opencode-sdk` (`cskwork #1, #57, #60, #66`)**
+- [x] **6.2. Adapter điều khiển ngoài cho Claude Code / Codex / Pi & Cầu nối `opencode-sdk` (`cskwork #1, #57, #60, #66`)**
   - **Mô tả**:
     - Thêm `adapters/agent/` cung cấp stdio MCP server cho Claude Code / Codex và extension cho Pi để đọc trạng thái task, coverage, findings và điều khiển task từ bên ngoài.
     - *(Tùy chọn)* Thêm `opencodesdk/` và `adapters/opencode-sdk/` sau khi đánh giá xử lý cảnh báo phụ thuộc `zod` (`cskwork #67`).
