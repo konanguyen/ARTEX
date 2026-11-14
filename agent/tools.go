@@ -264,8 +264,16 @@ func pidList(raw []json.RawMessage) []int64 {
 
 func obj(props map[string]any, required ...string) map[string]any {
 	m := map[string]any{"type": "object", "properties": props}
-	if len(required) > 0 {
-		m["required"] = required
+	// Blank names are dropped, and "required" is omitted when nothing is left:
+	// strict providers reject "required": [""] and fail every run carrying the tool.
+	req := make([]string, 0, len(required))
+	for _, r := range required {
+		if strings.TrimSpace(r) != "" {
+			req = append(req, r)
+		}
+	}
+	if len(req) > 0 {
+		m["required"] = req
 	}
 	return m
 }
@@ -548,6 +556,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			}
 		}
 	}
+	// Task credentials (#3): test accounts for this target — user-declared (e.g. a
+	// program alias) plus accounts recorded by earlier runs. Surfaced every round so
+	// authenticated testing reuses them instead of re-registering, and so accounts
+	// this run registers get saved back (see save_task_credential).
+	if creds := t.taskCredentialOverview(); creds != nil {
+		out["task_credentials"] = creds
+		out["task_credentials_note"] = "test accounts for this task; use the matching entry for authenticated testing instead of registering a new account; entries with an empty password mean you must register that account first (strong unique password) and record it via save_task_credential; ALWAYS record accounts you register via save_task_credential"
+	}
+	ws, err := t.outputWithdrawals()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	ws.annotate(out)
 	return out
 }
 
@@ -927,7 +948,7 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 				}
 				out = append(out, m)
 			}
-			return jsonResult(out)
+			return t.withdrawnResult(out)
 		})
 }
 
@@ -969,7 +990,7 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 			if hasMore && len(f) > 0 {
 				res["next_before"] = f[len(f)-1].ID // 传回它取下一页(更旧的)
 			}
-			return jsonResult(res)
+			return t.withdrawnResult(res)
 		})
 }
 
@@ -1011,7 +1032,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return jsonResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
+			return t.withdrawnResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
 		})
 }
 
@@ -1225,9 +1246,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
+		"counterevidence":      str("optional: what you tested that did not work (variants, paths, or bypasses that were blocked or came back negative). Fill it when your confidence is not high; omitting it never blocks reporting."),
+		"confidence_rationale": str("optional: why the conclusion holds (which observation rules out the benign explanation). Fill it when your confidence is not high; omitting it never blocks reporting."),
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			Counterevidence                              string            `json:"counterevidence"`
+			ConfidenceRationale                          string            `json:"confidence_rationale"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1254,7 +1279,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Counterevidence: a.Counterevidence, ConfidenceRationale: a.ConfidenceRationale}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1777,7 +1802,7 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			}
 			if pick == nil {
 				if intentNode.Inherited {
-					return jsonResult(inheritedMap(map[string]any{
+					return t.withdrawnResult(inheritedMap(map[string]any{
 						"intent_id": id, "final_text": "（该 work 尚无任何输出）",
 					}, intentNode.SourceTaskID))
 				}
@@ -1794,7 +1819,7 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}
-			return jsonResult(result)
+			return t.withdrawnResult(result)
 		})
 }
 
@@ -1904,7 +1929,7 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 				if intentNode.Inherited {
 					inheritedMap(result, intentNode.SourceTaskID)
 				}
-				return jsonResult(result)
+				return t.withdrawnResult(result)
 			}
 			// ①/② summary stream, optionally keyword-filtered; 100-char summaries.
 			var acts []db.Activity
@@ -1921,7 +1946,7 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}
-			return jsonResult(result)
+			return t.withdrawnResult(result)
 		})
 }
 
@@ -1967,7 +1992,7 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 				}
 				hits = append(hits, hit)
 			}
-			return jsonResult(map[string]any{"query": a.Q, "hits": hits})
+			return t.withdrawnResult(map[string]any{"query": a.Q, "hits": hits})
 		})
 }
 

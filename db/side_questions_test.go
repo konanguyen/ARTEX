@@ -32,6 +32,47 @@ func sideFixture(t *testing.T) (*DB, sidequestion.Snapshot) {
 	return d, s
 }
 
+func TestSideSnapshotRejectsSoftDeletedIntent(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	task, err := d.CreateTaskWithOptions("Worker side snapshot", "Retain only live side conversations", TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	iid := mustIntent(t, store, "Finished worker")
+	if err := store.SetIntentState(iid, "done"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := sidequestion.Snapshot{
+		Parent: sidequestion.Parent{TaskID: task.ID, ExplorationID: task.ExplorationID, IntentID: iid},
+		RunID:  1, Version: 1, CapturedAt: time.Now().UTC(),
+	}
+	// A finished, undeleted worker still accepts snapshots and later versions.
+	for range 2 {
+		if err := d.SaveSideSnapshot(t.Context(), snapshot); err != nil {
+			t.Fatalf("done intent rejected snapshot: %v", err)
+		}
+		snapshot.Version++
+	}
+	if _, err := store.SoftDeleteIntent(iid, "done", "Incorrect conclusion"); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := d.SideSnapshot(t.Context(), snapshot.Parent.Key()); err != nil || saved != nil {
+		t.Fatalf("soft delete retained side snapshot: %+v %v", saved, err)
+	}
+	if err := d.SaveSideSnapshot(t.Context(), snapshot); !errors.Is(err, ErrSideParentGone) {
+		t.Errorf("late snapshot: got %v, want ErrSideParentGone", err)
+	}
+	if saved, err := d.SideSnapshot(t.Context(), snapshot.Parent.Key()); err != nil || saved != nil {
+		t.Fatalf("late snapshot recreated deleted worker session: %+v %v", saved, err)
+	}
+}
+
 func TestSideHistoryIdempotencyPagingAndRecovery(t *testing.T) {
 	d, s := sideFixture(t)
 	ctx := t.Context()

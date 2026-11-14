@@ -43,6 +43,7 @@ import type { LLMProfile, Task } from "@/lib/types";
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
+import { CredentialsTab } from "./_tabs/credentials-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
@@ -214,6 +215,7 @@ function TaskDetailInner() {
     { value: "findings", label: t("tasks.detail.tabs.findings") },
     { value: "retests", label: t("tasks.detail.tabs.retests") },
     { value: "assets", label: t("tasks.detail.tabs.assets") },
+    { value: "credentials", label: t("tasks.detail.tabs.credentials") },
     { value: "coverage", label: t("tasks.detail.tabs.coverage") },
     { value: "intercept", label: t("tasks.detail.tabs.intercept") },
     { value: "report", label: t("tasks.detail.tabs.report") },
@@ -435,6 +437,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="findings" className="mt-0">
           <FindingsTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="credentials" className="mt-0">
+          <CredentialsTab taskId={task.id} />
         </TabsContent>
         <TabsContent value="retests" className="mt-0">
           <RetestsTab key={id} taskId={id} />

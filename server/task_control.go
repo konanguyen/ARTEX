@@ -207,21 +207,27 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 		//   hard(真删除):物理删除该意图及"仅由它支撑"的独占子孙节点(级联到叶子),避免留下
 		//     孤立数据;共享节点、goal、任务根事实保留。
 		// 两种模式都用 cancelled 触发告知 planner(意图内容 + 删除原因),让它据此重规划。
-		if node.State != "running" && node.State != "paused" && node.State != "open" {
-			return out, fmt.Errorf("only open, running, or paused intents can be deleted")
+		switch node.State {
+		case "open", "running", "paused":
+		case "done", "blocked", "exhausted", "stopped":
+		default:
+			return out, fmt.Errorf("This intent cannot be deleted in its current state")
 		}
 		reason = strings.TrimSpace(reason)
 		if reason == "" {
-			return out, fmt.Errorf("please provide a reason for deletion")
+			return out, fmt.Errorf("A deletion reason is required")
 		}
+		expectedState := node.State
 		if node.State == "running" {
 			if err := s.engine.ControlWork(ctx, iid, "cancel"); err != nil {
 				return out, err
 			}
+			// ControlWork waits for the worker to persist its cancellation barrier.
+			expectedState = "paused"
 		}
 		summary := intentSummaryOf(node)
 		if mode == "hard" {
-			cleanup, err := t.Store.CancelIntent(iid)
+			cleanup, err := t.Store.CancelIntent(iid, expectedState)
 			if err != nil {
 				return out, err
 			}
@@ -230,7 +236,7 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 			out.Deleted = &cleanup
 			out.State = "" // 节点已删除,前端据 Deleted 从列表移除
 		} else {
-			if _, err := t.Store.SoftDeleteIntent(iid, reason); err != nil {
+			if _, err := t.Store.SoftDeleteIntent(iid, expectedState, reason); err != nil {
 				return out, err
 			}
 			s.cancelWorkerSide(t.ID, t.ExpID, iid)

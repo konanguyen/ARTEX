@@ -160,6 +160,6 @@ func (t *ToolSet) expandDigest() actool.CoreTool {
 				out["inherited"] = true
 				out["source_task_id"] = srcTaskID
 			}
-			return jsonResult(out)
+			return t.withdrawnResult(out)
 		})
 }

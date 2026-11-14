@@ -76,6 +76,9 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 	if has["update_finding_report"] && has["bind_finding_traffic"] && has["get_finding_traffic"] {
 		guidance += "\n\n**报告前自动关联流量（已开启）**：你负责为本次触发的漏洞核对并绑定流量，再撰写报告。先从 report_finding 返回 JSON 或 get_task_node_detail / list_task_findings 取得明确的 finding_id 与 finding_node_id。读取漏洞详情、对应意图的执行记录及已有证据清单，优先使用上报者交接的真实 ID。若本次验证为 HTTP 且流量工具可用，用 traffic_search 筛选候选，再用 traffic_get 逐条核实请求/响应确实支持该漏洞；域名和时间只用于筛选，不证明归属。将确认的证据按复现顺序用 bind_finding_traffic(finding_id, traffic_refs) 关联，选择 baseline / proof / verification / supporting 并说明用途。只能操作本次漏洞，不重复创建漏洞或重新探测目标。绑定成功后重新调用 get_finding_traffic 获取最新 version，读取所需正文，再将实际读取的 version 作为 evidence_version 传给 update_finding_report（其 finding_id 参数仍用 finding_node_id）。已有绑定不必重复追加。TCP、未采集、工具不可用或没有确切匹配时，跳过自动绑定，依据文字/命令证据正常写报告并说明原因，不得为凑齐流量而猜测。绑定失败不宣称成功；保留已有证据并在报告说明未绑定原因。"
 	}
+	if has["update_finding_report"] {
+		guidance += findingVerificationGuidance
+	}
 	if guidance != "" || has["get_finding_traffic"] || has["update_finding_report"] {
 		guidance += findingIDGuidance
 	}
@@ -126,3 +129,8 @@ func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([
 	}
 	return db.NormalizeTrafficRefs(append(append([]db.TrafficRef{}, explicit...), payload.Refs...))
 }
+
+// findingVerificationGuidance tells the report writer how to declare proof
+// (S1). The server downgrades any finding whose declaration does not hold up,
+// so the agent must never state a level or quote it cannot read in the bound body.
+const findingVerificationGuidance = "\n\n**Verification (S1)**: when you call update_finding_report, also declare poe_level (0-4) and evidence_quotes. poe_level 1 = error, timing or response variation; 2 = structural manipulation (boolean, UNION, parser difference); 3 = actual data extracted; 4 = critical impact (admin credentials, code execution). L3 is the minimum for a verified finding. evidence_quotes must be exact lines copied from a bound proof or verification response body (read it with get_finding_traffic first), never from memory or from the report text; the server checks each quote verbatim after whitespace normalization. If you cannot quote the proof, omit the quotes: the finding then stays unverified, which is acceptable. Do not raise poe_level to get a verified status."

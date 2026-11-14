@@ -24,7 +24,7 @@ func lockSideParent(ctx context.Context, tx *sql.Tx, p sidequestion.Parent) erro
 	} else {
 		err = tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id=$1 AND exploration_id=$2 AND deleted_at IS NULL AND archived_at IS NULL FOR SHARE`, p.TaskID, p.ExplorationID).Scan(&id)
 		if err == nil && p.IntentID > 0 {
-			err = tx.QueryRowContext(ctx, `SELECT id FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state<>'stopped' FOR SHARE`, p.IntentID, p.ExplorationID).Scan(&id)
+			err = tx.QueryRowContext(ctx, `SELECT id FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state NOT IN ('stopped','deleted') FOR SHARE`, p.IntentID, p.ExplorationID).Scan(&id)
 		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {

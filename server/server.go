@@ -723,6 +723,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptUpdateRule)
 	mux.HandleFunc("DELETE /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptDeleteRule)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules/{rid}/toggle", s.taskInterceptToggleRule)
+	mux.HandleFunc("GET /api/tasks/{id}/credentials", s.listTaskCredentials)
+	mux.HandleFunc("POST /api/tasks/{id}/credentials", s.addTaskCredential)
+	mux.HandleFunc("DELETE /api/tasks/{id}/credentials/{cid}", s.deleteTaskCredential)
 	mux.HandleFunc("POST /api/tasks/control/batch", s.controlTasksBatch)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)
@@ -1238,10 +1241,7 @@ func restoreRerunIntent(t *Task, before *db.Node) error {
 	if t == nil || before == nil {
 		return fmt.Errorf("missing intent rollback snapshot")
 	}
-	if before.State == "blocked" && before.BlockedReason != "" {
-		return t.Store.SetIntentBlockedReason(before.ID, before.BlockedReason)
-	}
-	return t.Store.SetIntentState(before.ID, before.State)
+	return t.Store.RestoreReopenedIntent(before.ID, before.State, before.BlockedReason)
 }
 
 func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
@@ -1546,6 +1546,16 @@ type createTaskReq struct {
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// Credentials: test accounts declared at creation (#3). An empty password means
+	// "agent generates": the agent registers that account and records it back.
+	Credentials []taskCredentialReq `json:"credentials,omitempty"`
+}
+
+type taskCredentialReq struct {
+	Domain   string `json:"domain"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Note     string `json:"note"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1617,6 +1627,20 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] new task #%s «%s» goal: %s", t.ID, req.Description, req.Goal)
+	// Task credentials (#3): rows land after the task row commits; a bad entry
+	// fails the whole request so the UI never shows a half-configured task.
+	if len(req.Credentials) > 0 {
+		taskNum, _ := strconv.ParseInt(t.ID, 10, 64)
+		for _, c := range req.Credentials {
+			if _, err := s.m.PG().UpsertTaskCredential(taskNum, db.TaskCredentialInput{
+				Domain: c.Domain, Username: c.Username, Password: c.Password,
+				Source: "user", Note: c.Note,
+			}); err != nil {
+				writeErr(w, 400, "invalid credential for "+c.Domain+": "+err.Error())
+				return
+			}
+		}
+	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)

@@ -39,6 +39,7 @@ import {
   StarIcon,
   TagsIcon,
   Trash2Icon,
+  TrashIcon,
   Undo2Icon,
   XIcon,
 } from "lucide-react";
@@ -133,6 +134,7 @@ import type {
   TaskArchive,
   TaskArchiveState,
   TaskCategory,
+  TaskCredentialInput,
   TaskStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -3131,6 +3133,7 @@ function CreateTaskSheet({
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
+  const [credentials, setCredentials] = React.useState<TaskCredentialInput[]>([]); // test accounts declared at creation (#3); an empty password = the agent registers that account and records it
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
@@ -3200,6 +3203,9 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        credentials: credentials
+          .map((c) => ({ domain: c.domain.trim(), username: c.username.trim(), password: c.password, note: c.note?.trim() ?? "" }))
+          .filter((c) => c.domain !== "" && c.username !== ""),
       });
       toast.success(t("tasks.new.taskCreated"));
       setName("");
@@ -3215,6 +3221,7 @@ function CreateTaskSheet({
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
       setInterceptRules([]);
+      setCredentials([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3437,6 +3444,57 @@ function CreateTaskSheet({
                 </div>
               </CollapsibleContent>
             </Collapsible>
+
+            <div className="grid gap-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">{t("tasks.new.credentialsLabel")}</label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setCredentials((prev) => [...prev, { domain: "", username: "", password: "", note: "" }])}
+                >
+                  <PlusIcon /> {t("tasks.new.credentialsAddAccount")}
+                </Button>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {t("tasks.new.credentialsDesc")}
+              </p>
+              {credentials.map((c, i) => (
+                <div key={i} className="grid gap-2 sm:grid-cols-[1fr_1fr_1fr_auto]">
+                  <Input
+                    placeholder={t("tasks.credentials.domainPlaceholder")}
+                    value={c.domain}
+                    onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, domain: e.target.value } : x)))}
+                  />
+                  <Input
+                    placeholder={t("tasks.credentials.usernamePlaceholder")}
+                    value={c.username}
+                    onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, username: e.target.value } : x)))}
+                  />
+                  <Input
+                    placeholder={t("tasks.credentials.passwordPlaceholder")}
+                    value={c.password}
+                    onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, password: e.target.value } : x)))}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={t("tasks.new.credentialsRemoveAccount")}
+                    onClick={() => setCredentials((prev) => prev.filter((_, j) => j !== i))}
+                  >
+                    <TrashIcon />
+                  </Button>
+                  <Input
+                    className="sm:col-span-4"
+                    placeholder={t("tasks.credentials.notePlaceholder")}
+                    value={c.note ?? ""}
+                    onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, note: e.target.value } : x)))}
+                  />
+                </div>
+              ))}
+            </div>
           </div>
         </div>
 

@@ -204,6 +204,13 @@ ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
 -- a node most recently went from "has a live downstream branch" to none (NULL = hot).
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS content_version  INT    NOT NULL DEFAULT 0;
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS cold_since_round BIGINT;
+-- Intent claim lease: unclaim_token is the fencing token of the current claim (fresh
+-- per claim, cleared when the claim is settled or taken over); last_heartbeat_at is
+-- the claimer's latest heartbeat. A running intent whose heartbeat is older than
+-- db.IntentClaimTTL may be taken over. Both are NULL on rows claimed before these
+-- columns existed, which counts as expired.
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS unclaim_token     TEXT;
 -- ck_node_kind: existing installs predate the 'digest' kind — recreate to allow it.
 DO $$
 BEGIN
@@ -1168,6 +1175,16 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+-- Machine-checked proof state (S1). Separate from status (human disposition). Existing rows stay
+-- unverified / POE 0: history is never auto-verified. Values validated server-side, no CHECK.
+-- verification_status: verified / unverified / blocked / not_assessed / false_positive.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS poe_level SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_note TEXT NOT NULL DEFAULT '';
+-- Reporter-supplied reasoning, both optional (empty = not given): counterevidence is what was
+-- tested and did not work; confidence_rationale is why the conclusion holds.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS counterevidence TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence_rationale TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,
@@ -1305,6 +1322,22 @@ CREATE TABLE IF NOT EXISTS task_intercept_rules (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_task_intercept_task ON task_intercept_rules(task_id);
+-- Per-task test accounts (#3): user-declared (e.g. a program-provided alias
+-- account) or agent-registered and recorded so they are not forgotten. Passwords
+-- are local-only, same trust domain as captured traffic evidence; the UI masks
+-- them by default.
+CREATE TABLE IF NOT EXISTS task_credentials (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    domain     TEXT NOT NULL,
+    username   TEXT NOT NULL,
+    password   TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user','agent')),
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, domain, username)
+);
 -- 补旧库(本会话早前建过该表、无 action 列)：加列(带 IF NOT EXISTS)。
 ALTER TABLE task_intercept_rules ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'block';
 DROP TRIGGER IF EXISTS trg_task_intercept_rules_upd ON task_intercept_rules;

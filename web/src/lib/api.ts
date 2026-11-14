@@ -86,6 +86,8 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskCredential,
+  TaskCredentialInput,
   TaskGoal,
   TaskLLMResolutions,
   TaskNode,
@@ -217,6 +219,7 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   const p = new URLSearchParams();
   if (q.severity && q.severity !== "all") p.set("severity", q.severity);
   if (q.status && q.status !== "all") p.set("status", q.status);
+  if (q.verificationStatus && q.verificationStatus !== "all") p.set("verification_status", q.verificationStatus);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
   if (q.query?.trim()) p.set("q", q.query.trim());
@@ -262,6 +265,7 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    credentials?: TaskCredentialInput[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -276,12 +280,17 @@ export const api = {
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      credentials: input.credentials ?? [], // test accounts declared at creation; an empty password = the agent generates and records it (#3)
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
+  taskCredentials: (id: string) => get<TaskCredential[]>(`/tasks/${id}/credentials`).then((r) => arr(r)),
+  addTaskCredential: (id: string, input: TaskCredentialInput) =>
+    post<TaskCredential>(`/tasks/${id}/credentials`, input),
+  deleteTaskCredential: (id: string, cid: number) => del(`/tasks/${id}/credentials/${cid}`),
   renameTaskCategory: (id: number, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
   deleteTaskCategory: (id: number) => del<{ deleted: number }>(`/task-categories/${id}`),
   updateTaskCategory: (taskId: string, categoryId?: number) =>

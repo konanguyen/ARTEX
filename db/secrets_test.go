@@ -53,9 +53,9 @@ func TestSecretBoxCrypto(t *testing.T) {
 	}
 }
 
-type secretRows struct{ llm, mcp, ch int64 }
+type secretRows struct{ llm, mcp, cred, ch, task int64 }
 
-var plainSecrets = []string{"sk-plain-llm", "mcp-plain-tok", "hook-plain-secret", "llmproxy-plain-pass",
+var plainSecrets = []string{"sk-plain-llm", "mcp-plain-tok", "plain-pass", "hook-plain-secret", "llmproxy-plain-pass",
 	"brave-plain", "tavily-plain", "wsproxy-plain-pass", "gproxy-plain-pass"}
 
 // secretSettingValues are the four secret settings written by the fixture.
@@ -74,14 +74,19 @@ const deleteSecretSettings = `DELETE FROM settings WHERE key IN ('brave_search_a
 // a legacy database, as raw plaintext SQL.
 func secretFixture(t *testing.T, d *DB, legacy bool) (r secretRows) {
 	t.Helper()
+	task, err := d.CreateTask("secrets at rest", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.task = task.ID
 	t.Cleanup(func() {
+		_ = d.DeleteTask(r.task)
 		d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, r.llm)
 		d.Exec(`DELETE FROM mcp_servers WHERE id=$1`, r.mcp)
 		d.Exec(`DELETE FROM notification_channels WHERE id=$1`, r.ch)
 		d.Exec(deleteSecretSettings)
 	})
 	env, cfg := `{"Authorization":"mcp-plain-tok"}`, `{"url":"https://h.example","headers":{"X":"hook-plain-secret"}}`
-	var err error
 	if legacy {
 		ins := func(id *int64, q string, args ...any) {
 			if err := d.QueryRow(q, args...).Scan(id); err != nil {
@@ -95,6 +100,7 @@ func secretFixture(t *testing.T, d *DB, legacy bool) (r secretRows) {
 			}
 		}
 		ins(&r.mcp, `INSERT INTO mcp_servers(name,transport,env) VALUES ('t-sec','http',$1) RETURNING id`, env)
+		ins(&r.cred, `INSERT INTO task_credentials(task_id,domain,username,password) VALUES ($1,'x.example','u','plain-pass') RETURNING id`, r.task)
 		ins(&r.ch, `INSERT INTO notification_channels(name,kind,config) VALUES ('t-sec','webhook',$1) RETURNING id`, cfg)
 		return r
 	}
@@ -108,6 +114,11 @@ func secretFixture(t *testing.T, d *DB, legacy bool) (r secretRows) {
 		r.mcp, err = d.SaveMCP(&MCPServer{Name: "t-sec", Transport: "http", Env: json.RawMessage(env)})
 	}
 	if err == nil {
+		var c TaskCredential
+		c, err = d.UpsertTaskCredential(r.task, TaskCredentialInput{Domain: "x.example", Username: "u", Password: "plain-pass"})
+		r.cred = c.ID
+	}
+	if err == nil {
 		r.ch, err = d.SaveNotificationChannel(context.Background(), &NotificationChannel{Name: "t-sec", Kind: "webhook", Config: json.RawMessage(cfg)})
 	}
 	if err != nil {
@@ -119,16 +130,16 @@ func secretFixture(t *testing.T, d *DB, legacy bool) (r secretRows) {
 // rawSecrets reads the secret columns and settings as stored in PostgreSQL.
 func rawSecrets(t *testing.T, d *DB, r secretRows) string {
 	t.Helper()
-	var a, b, e, px string
+	var a, b, c, e, px string
 	if err := d.QueryRow(`SELECT (SELECT api_key FROM llm_profiles WHERE id=$1), (SELECT env::text FROM mcp_servers WHERE id=$2),
-(SELECT config::text FROM notification_channels WHERE id=$3), (SELECT proxy FROM llm_profiles WHERE id=$1)`,
-		r.llm, r.mcp, r.ch).Scan(&a, &b, &e, &px); err != nil {
+(SELECT password FROM task_credentials WHERE id=$3), (SELECT config::text FROM notification_channels WHERE id=$4), (SELECT proxy FROM llm_profiles WHERE id=$1)`,
+		r.llm, r.mcp, r.cred, r.ch).Scan(&a, &b, &c, &e, &px); err != nil {
 		t.Fatal(err)
 	}
-	if !isEncrypted(a) || !isSealed(colMCPEnv, b) || !isSealed(colNotifConfig, e) || !isEncrypted(px) {
+	if !isEncrypted(a) || !isSealed(colMCPEnv, b) || !isEncrypted(c) || !isSealed(colNotifConfig, e) || !isEncrypted(px) {
 		t.Fatal("a stored secret is not encrypted")
 	}
-	vals := []string{a, b, e, px}
+	vals := []string{a, b, c, e, px}
 	for _, k := range secretSettingKeys {
 		var v string
 		if err := d.QueryRow(`SELECT value FROM settings WHERE key=$1`, k).Scan(&v); err != nil || !isEncrypted(v) {
@@ -170,6 +181,9 @@ func assertPlainReads(t *testing.T, d *DB, r secretRows) {
 		if m.ID == r.mcp {
 			got += string(m.Env)
 		}
+	}
+	if creds, err := d.TaskCredentials(r.task); err == nil && len(creds) == 1 {
+		got += creds[0].Password
 	}
 	if ch, err := d.NotificationChannelByID(context.Background(), r.ch); err == nil {
 		got += string(ch.Config)

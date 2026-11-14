@@ -261,7 +261,7 @@ func (s *Server) sideParent(w http.ResponseWriter, r *http.Request, kind string)
 			writeErr(w, 404, "intent not found")
 			return p, false
 		}
-		if n.State == "stopped" {
+		if n.State == "stopped" || n.State == db.StateIntentDeleted {
 			writeErr(w, 409, "Worker has been deleted")
 			return p, false
 		}

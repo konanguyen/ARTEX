@@ -47,6 +47,8 @@ var (
 		"The user paused the running worker. This invocation was cancelled and the intent transitioned to paused; recorded intents, facts, findings, and activity records are retained, and will re-execute from the beginning upon resumption.")
 	AbortWorkCancelledByUser = cause("work_cancelled_by_user", "User deleted this worker intent",
 		"The user deleted the running worker. This invocation was cancelled; after the worker exits the write region, the server handles deletion per selected mode — soft delete marks deleted and retains all outputs, hard delete cascades removal of this intent and orphan downstream nodes.")
+	AbortWorkClaimLost = cause("work_claim_lost", "Another Worker took this intent over",
+		"This Worker's claim on the intent expired (no heartbeat reached the database within the claim TTL) and another Worker took the intent over, so its heartbeat was rejected. This run was cancelled and its result is discarded; the intent now belongs to the new claimer")
 	AbortWorkFinished = cause("work_finished", "Worker finished normally",
 		"The worker finished normally and the engine released its context resources in detachWork. This is not an interruption; if appearing in an abort notice, it indicates a race between cancellation and cleanup.")
 	AbortPausedRaceGuard = cause("paused_race_guard", "Refusing run while task is paused",

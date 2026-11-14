@@ -97,17 +97,17 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
 
 ## Giai đoạn 3: Quản lý Task, Kho Tài khoản Test, Xác minh Lỗ hổng & Thu hồi Worker Output
 
-- [ ] **3.1. Kho tài khoản Test theo Task (`Per-Task Credentials Vault`, `BaaRai #3, #130` — `c177ab9`, `00f5d8c`)** ⚠️ **`[Chạm nhẹ Overview/Prompt]`**
+- [x] **3.1. Kho tài khoản Test theo Task (`Per-Task Credentials Vault`, `BaaRai #3, #130` — `c177ab9`, `00f5d8c`)** ⚠️ **`[Chạm nhẹ Overview/Prompt]`**
   - **Mô tả**: Bảng `task_credentials`, API `GET/POST/DELETE /api/tasks/{id}/credentials`, mục khai báo tài khoản khi tạo Task, tab `Credentials` ở chi tiết Task (ẩn/hiện/copy mật khẩu), và 2 tool `save_task_credential` & `list_task_credentials` cho worker/pentest (hỗ trợ chế độ để trống mật khẩu cho agent tự đăng ký rồi lưu lại).
   - **File chính**: `db/task_credentials.go`, `db/schema.sql`, `agent/tools_creds.go`, `agent/toolcatalog.go`, `server/task_credentials.go`, `web/src/app/(main)/function/tasks/detail/_tabs/credentials-tab.tsx`, `web/src/app/(main)/function/tasks/page.tsx`.
 
-- [ ] **3.2. Thu hồi / Xóa kết quả của Worker đã hoàn tất (`Delete Finished Worker Output`, `cskwork #62, #73` — `v0.9.0`)** ⚠️ **`[Chạm nhẹ Planner Context]`**
+- [x] **3.2. Thu hồi / Xóa kết quả của Worker đã hoàn tất (`Delete Finished Worker Output`, `cskwork #62, #73` — `v0.9.0`)** ⚠️ **`[Chạm nhẹ Planner Context]`**
   - **Mô tả**: Cho phép xóa cả các intent đã kết thúc (`done`, `blocked`, `exhausted`, `stopped`) với lý do bắt buộc:
     - **Retract (Soft delete)**: giữ lại lịch sử nhưng đánh dấu `[withdrawn]` xuyên suốt các vòng planner, `graph_overview`, `list_facts`, `list_findings`, `node_detail`, `get_worker_output`...
     - **Permanent delete (Hard delete)**: xóa intent cùng các node chỉ do nó chứng minh, có khóa row chống race condition với worker đang chạy, compaction và rerun.
   - **File chính**: `db/exploration.go`, `agent/tools.go`, `agent/planner.go`, `server/orchestration.go`, `web/src/app/(main)/function/tasks/detail/_tabs/sessions-tab.tsx`.
 
-- [ ] **3.3. Hệ thống Xác minh Lỗ hổng tự động (`Verified Findings — S1`, `BaaRai #162, #163, #164, #169, #193` — `v0.6.0`)** ⚠️ **`[Chạm Prompt ở #193]`**
+- [x] **3.3. Hệ thống Xác minh Lỗ hổng tự động (`Verified Findings — S1`, `BaaRai #162, #163, #164, #169, #193` — `v0.6.0`)** ⚠️ **`[Chạm Prompt ở #193]`**
   - **Mô tả**:
     - Thêm `poe_level` (0–4), `verification_status` (`verified`, `unverified`, `blocked`, `not_assessed`, `false_positive`), `verification_note`.
     - Tự động đối chiếu trích dẫn bằng chứng (≥ 8 ký tự) nguyên văn trong HTTP response body đã gắn (hỗ trợ giải nén `gzip`/`deflate` tối đa 4 MiB).
@@ -116,7 +116,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - Hiển thị badge xác minh, bộ lọc và ghi chú trên UI Findings.
   - **File chính**: `db/findings.go`, `db/schema.sql`, `agent/finding_recorder.go`, `agent/finding_workflow.go`, `agent/retester.go`, `server/findings.go`, `web/src/app/(main)/function/findings/`.
 
-- [ ] **3.4. Intent Claim Lease & Fencing (`BaaRai S3c #176` — `7ccae15`)**
+- [x] **3.4. Intent Claim Lease & Fencing (`BaaRai S3c #176` — `7ccae15`)**
   - **Mô tả**: Thêm cơ chế thuê bao intent có heartbeat 15s, TTL 90s và `owner_token` để ngăn worker bị treo ghi đè kết quả sau khi intent đã được cấp lại cho worker khác.
   - **File chính**: `db/exploration.go`, `db/schema.sql`, `server/engine.go`.
 

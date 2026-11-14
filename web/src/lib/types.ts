@@ -481,6 +481,10 @@ export type FindingStatus =
   | "duplicate"
   | "risk_accepted";
 
+// Verification status (S1): the automated proof-of-exploitation outcome, distinct from the
+// human triage status above. "blocked" is produced by no path yet but is displayed when present.
+export type VerificationStatus = "verified" | "unverified" | "blocked" | "not_assessed" | "false_positive";
+
 // FindingAsset 是一个漏洞绑定的资产(已在后端预渲染 label)。
 export interface FindingAsset {
   id: string;
@@ -493,6 +497,11 @@ export interface Finding {
   evidence_version?: number;
   report_evidence_version?: number;
   report_stale?: boolean;
+  poe_level?: number; // proof-of-exploitation level (3 or 4 when verified); 0 = none declared
+  verification_status?: VerificationStatus; // automated verification outcome (S1)
+  verification_note?: string; // why the status was reached; empty when verified
+  counterevidence?: string; // what was tested and did not work; optional, omitted when empty
+  confidence_rationale?: string; // why the conclusion holds; optional, omitted when empty
   id: string;
   finding_id?: string; // 独立 findings 表的行 id,状态更新的句柄(任务内旧节点可能缺失)
   vulnclass: string;
@@ -575,6 +584,7 @@ export interface FindingQuery {
   pageSize: number;
   severity?: "all" | Severity;
   status?: "all" | FindingStatus;
+  verificationStatus?: "all" | VerificationStatus;
   vulnclass?: string;
   task?: string; // 任务 id;"all"/空 = 不按任务筛选
   query?: string;
@@ -1300,6 +1310,24 @@ export interface AssetInterceptRuleInput {
   note: string;
   enabled: boolean;
 }
+
+// Task credentials (#3): per-task test accounts. An empty password on a user-declared
+// entry means "agent generates": the agent registers that account and records it back.
+export type TaskCredentialInput = {
+  domain: string;
+  username: string;
+  password: string;
+  note?: string;
+};
+
+export type TaskCredential = TaskCredentialInput & {
+  id: number;
+  task_id: number;
+  source: "user" | "agent";
+  note: string;
+  created_at: string;
+  updated_at: string;
+};
 
 export interface AssetInterceptRule {
   id: number;

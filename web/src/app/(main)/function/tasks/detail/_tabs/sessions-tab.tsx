@@ -346,6 +346,13 @@ function intentToSession(n: TaskNode): Session {
   };
 }
 
+// Only a finished worker's output is withdrawn from use: server/task_control.go sets
+// OutputDeletion for the terminal states alone, so for an unfinished worker the planner
+// is just told the intent will not execute. The soft-delete copy has to match that.
+function withdrawsOutput(status: string | undefined): boolean {
+  return status === "done" || status === "blocked" || status === "exhausted" || status === "stopped";
+}
+
 function SessionItem({
   s,
   active,
@@ -380,8 +387,14 @@ function SessionItem({
     s.role === "worker" &&
     !s.inherited &&
     !deleted &&
-    // pending = 待领(open)意图;连同运行中/已暂停都允许删除。
-    (s.status === "running" || s.status === "paused" || s.status === "pending");
+    // Pending means unclaimed/open intent; finished workers can also have their output withdrawn or removed.
+    (s.status === "running" ||
+      s.status === "paused" ||
+      s.status === "pending" ||
+      s.status === "done" ||
+      s.status === "blocked" ||
+      s.status === "exhausted" ||
+      s.status === "stopped");
   return (
     <div
       className={cn(
@@ -551,6 +564,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const [cancelReason, setCancelReason] = React.useState("");
   // 删除模式:soft=假删除(默认,置 deleted + 记原因,保留数据)| hard=真删除(级联移除独占子孙)。
   const [deleteMode, setDeleteMode] = React.useState<"soft" | "hard">("soft");
+  const cancelWithdrawsOutput = withdrawsOutput(cancelIntent?.status);
   const [workerMessage, setWorkerMessage] = React.useState("");
   const [workerMessageRequestId, setWorkerMessageRequestId] = React.useState("");
   const [workerMessageSending, setWorkerMessageSending] = React.useState(false);
@@ -2185,7 +2199,11 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               <AlertDialogDescription className="break-words whitespace-normal">
                 {deleteMode === "hard"
                   ? t("tasks.detail.sessions.hardDeleteDesc")
-                  : t("tasks.detail.sessions.softDeleteDesc")}
+                  : t(
+                      cancelWithdrawsOutput
+                        ? "tasks.detail.sessions.softDeleteWithdrawDesc"
+                        : "tasks.detail.sessions.softDeleteDesc",
+                    )}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <div className="grid gap-3 py-1">
@@ -2199,7 +2217,13 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                   )}
                 >
                   <div className="font-medium">{t("tasks.detail.sessions.softDeleteTab")}</div>
-                  <div className="text-xs text-muted-foreground">{t("tasks.detail.sessions.softDeleteSub")}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {t(
+                      cancelWithdrawsOutput
+                        ? "tasks.detail.sessions.softDeleteWithdrawSub"
+                        : "tasks.detail.sessions.softDeleteSub",
+                    )}
+                  </div>
                 </button>
                 <button
                   type="button"

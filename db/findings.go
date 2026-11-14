@@ -20,20 +20,26 @@ type DBFinding struct {
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
-	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
-	CreatedAt       time.Time
-	TaskDescription string // populated via LEFT JOIN on tasks
+	ID                 int64
+	TaskID             *int64
+	NodeID             *int64
+	VulnClass          string
+	Name               string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity           string
+	Summary            string
+	Evidence           string
+	Worker             string
+	AssetIDs           []int64
+	Status             string
+	PoELevel           int    // proof-of-exploitation level 0-4 (S1); 0 = none declared
+	VerificationStatus string // verified / unverified / blocked / not_assessed / false_positive
+	VerificationNote   string // why the status was reached; empty when verified
+	Report             string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	CreatedAt          time.Time
+	TaskDescription    string // populated via LEFT JOIN on tasks
+
+	Counterevidence     string // what was tested and did not work; optional, "" = not given
+	ConfidenceRationale string // why the conclusion holds; optional, "" = not given
 }
 
 // Finding triage states (findings.status).
@@ -105,6 +111,8 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
+	       f.poe_level, COALESCE(f.verification_status, 'unverified'), COALESCE(f.verification_note, ''),
+	       f.counterevidence, f.confidence_rationale,
  (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
 
 // scanFindings materializes rows selected via findingSelectCols.
@@ -118,7 +126,7 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.PoELevel, &f.VerificationStatus, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.TrafficCount); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -150,12 +158,13 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 // filter on that column". Sort is "severity" (severity desc, then newest) or
 // anything else (newest first).
 type FindingFilter struct {
-	Severity  string // high | medium | low
-	Status    string // pending | false_positive | ignored | resolved
-	VulnClass string
-	TaskID    string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
-	Query     string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
-	Sort      string // "severity" | "time"
+	Severity           string // high | medium | low
+	Status             string // pending | false_positive | ignored | resolved
+	VerificationStatus string // verified | unverified | blocked | not_assessed | false_positive
+	VulnClass          string
+	TaskID             string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
+	Query              string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
+	Sort               string // "severity" | "time"
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
@@ -186,6 +195,7 @@ func (f FindingFilter) where() (string, []any) {
 	}
 	add("severity", f.Severity)
 	add("status", f.Status)
+	add("verification_status", f.VerificationStatus)
 	add("vulnclass", f.VulnClass)
 	// task_id 是 bigint 列,按整数比较(不能走上面的文本 add);空/非法值忽略。
 	if f.TaskID == FindingUnassignedTask {
@@ -511,7 +521,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.PoELevel, &f.VerificationStatus, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.TrafficCount, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -639,7 +649,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.PoELevel, &f.VerificationStatus, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.TrafficCount, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

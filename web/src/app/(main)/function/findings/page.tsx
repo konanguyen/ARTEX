@@ -50,6 +50,7 @@ import type {
   FindingStats,
   FindingStatus,
   Severity,
+  VerificationStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -64,6 +65,8 @@ import {
   isSameFinding,
   SEVERITIES,
   UNASSIGNED_TASK,
+  VERIFICATION_META,
+  VERIFICATION_STATUSES,
 } from "./_components/findings-table";
 
 const FINDING_LIST_PREFERENCE_KEY = "artex_finding_list_preferences";
@@ -134,6 +137,7 @@ export default function FindingsPage() {
   const [view, setView] = React.useState<FindingView>("flat");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
+  const [verificationStatus, setVerificationStatus] = React.useState<"all" | VerificationStatus>("all");
   const [vulnclass, setVulnclass] = React.useState<string>("all");
   const [task, setTask] = React.useState<string>("all");
   const [sort, setSort] = React.useState<"severity" | "time">("severity");
@@ -164,7 +168,7 @@ export default function FindingsPage() {
   const retestRefreshVersion = React.useRef(0);
   const [deepenDescription, setDeepenDescription] = React.useState("");
   const [deepening, setDeepening] = React.useState(false);
-  const filterFingerprint = JSON.stringify([severity, status, vulnclass, task, sort, query]);
+  const filterFingerprint = JSON.stringify([severity, status, verificationStatus, vulnclass, task, sort, query]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
 
@@ -202,6 +206,7 @@ export default function FindingsPage() {
           view?: unknown;
           severity?: unknown;
           status?: unknown;
+          verificationStatus?: unknown;
           vulnclass?: unknown;
           task?: unknown;
           sort?: unknown;
@@ -212,6 +217,12 @@ export default function FindingsPage() {
         }
         if (parsed.status === "all" || FINDING_STATUSES.includes(parsed.status as FindingStatus)) {
           setStatus(parsed.status as "all" | FindingStatus);
+        }
+        if (
+          parsed.verificationStatus === "all" ||
+          VERIFICATION_STATUSES.includes(parsed.verificationStatus as VerificationStatus)
+        ) {
+          setVerificationStatus(parsed.verificationStatus as "all" | VerificationStatus);
         }
         if (typeof parsed.vulnclass === "string" && parsed.vulnclass) setVulnclass(parsed.vulnclass);
         if (typeof parsed.task === "string" && parsed.task) setTask(parsed.task);
@@ -227,9 +238,9 @@ export default function FindingsPage() {
     if (!preferencesHydrated) return;
     setLocalStorageValue(
       FINDING_LIST_PREFERENCE_KEY,
-      JSON.stringify({ view, severity, status, vulnclass, task, sort }),
+      JSON.stringify({ view, severity, status, verificationStatus, vulnclass, task, sort }),
     );
-  }, [preferencesHydrated, severity, sort, status, task, view, vulnclass]);
+  }, [preferencesHydrated, severity, sort, status, task, verificationStatus, view, vulnclass]);
 
   React.useEffect(() => {
     const timer = window.setTimeout(() => setQuery(search.trim()), 300);
@@ -288,7 +299,7 @@ export default function FindingsPage() {
       await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
-        filters: { severity, status, vulnclass, task, query, sort },
+        filters: { severity, status, verificationStatus, vulnclass, task, query, sort },
         ids: [...selectedIds],
       });
       setExportOpen(false);
@@ -328,6 +339,7 @@ export default function FindingsPage() {
         pageSize: flatPageSize,
         severity,
         status,
+        verificationStatus,
         vulnclass,
         task,
         query,
@@ -341,7 +353,19 @@ export default function FindingsPage() {
       // Polling keeps the last successful snapshot visible.
       setFlat((current) => ({ ...current, loading: false }));
     }
-  }, [activeAssetScope, filterFingerprint, flatPage, flatPageSize, severity, status, vulnclass, task, query, sort]);
+  }, [
+    activeAssetScope,
+    filterFingerprint,
+    flatPage,
+    flatPageSize,
+    severity,
+    status,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
   // loadAssetTree 取整棵资产树。树不随选中节点变化(否则选一下就塌成一条链),
   // 所以这里不带 assetScope。
@@ -351,7 +375,7 @@ export default function FindingsPage() {
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclass, task, query, sort });
+      const result = await api.findingAssetTree({ severity, status, verificationStatus, vulnclass, task, query, sort });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -366,7 +390,7 @@ export default function FindingsPage() {
       setAssetTree((current) => ({ ...current, loading: false }));
       toast.error(t("findings.toast.loadAssetTreeFailed", { message: (e as Error).message }));
     }
-  }, [filterFingerprint, severity, status, vulnclass, task, query, sort]);
+  }, [filterFingerprint, severity, status, verificationStatus, vulnclass, task, query, sort]);
 
   const refreshGroups = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
@@ -378,6 +402,7 @@ export default function FindingsPage() {
         pageSize,
         severity,
         status,
+        verificationStatus,
         vulnclass,
         task,
         query,
@@ -390,7 +415,7 @@ export default function FindingsPage() {
     } catch {
       // Polling keeps the last successful snapshot visible.
     }
-  }, [filterFingerprint, page, pageSize, severity, status, vulnclass, task, query, sort]);
+  }, [filterFingerprint, page, pageSize, severity, status, verificationStatus, vulnclass, task, query, sort]);
 
   const loadGroup = React.useCallback(
     async (key: string, groupPage: number, groupPageSize: number) => {
@@ -415,6 +440,7 @@ export default function FindingsPage() {
           pageSize: groupPageSize,
           severity,
           status,
+          verificationStatus,
           vulnclass,
           task: key,
           query,
@@ -449,7 +475,7 @@ export default function FindingsPage() {
         }));
       }
     },
-    [filterFingerprint, severity, status, vulnclass, query, sort],
+    [filterFingerprint, severity, status, verificationStatus, vulnclass, query, sort],
   );
 
   React.useEffect(() => {
@@ -895,6 +921,23 @@ export default function FindingsPage() {
               {FINDING_STATUSES.map((st) => (
                 <SelectItem key={st} value={st}>
                   {statusMeta("finding", st).label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select
+            value={verificationStatus}
+            onValueChange={(v) => setVerificationStatus(v as "all" | VerificationStatus)}
+          >
+            <SelectTrigger size="sm" className="w-48">
+              <SelectValue placeholder={t("findings.filter.verificationPlaceholder")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("findings.filter.allVerifications")}</SelectItem>
+              {VERIFICATION_STATUSES.map((st) => (
+                <SelectItem key={st} value={st}>
+                  {t(VERIFICATION_META[st].labelKey)}
                 </SelectItem>
               ))}
             </SelectContent>

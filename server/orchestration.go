@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -430,26 +432,57 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
 			"report":           strParam("详细报告全文,Markdown 格式"),
 			"evidence_version": map[string]any{"type": "integer", "description": "get_finding_traffic 返回的证据 version；用于防止报告覆盖新的证据变更"},
+			"poe_level":        map[string]any{"type": "integer", "description": "proof-of-exploitation level 0-4: 1 error/timing/response variation, 2 structural manipulation, 3 actual data extracted, 4 critical impact. L3 is the minimum for verified. Omit or 0 when not proven."},
+			"evidence_quotes":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "exact lines copied from a bound proof/verification response body (get_finding_traffic). Never from memory; the server checks each one verbatim after whitespace normalization."},
 		}, "finding_id", "report"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				EvidenceVersion *int64          `json:"evidence_version"`
 				FindingID       json.RawMessage `json:"finding_id"`
 				Report          string          `json:"report"`
+				PoELevel        *int            `json:"poe_level"`
+				EvidenceQuotes  []string        `json:"evidence_quotes"`
 			}
 			_ = json.Unmarshal(in, &a)
 			nodeID := parseProfileID(a.FindingID) // 复用「数字或数字字符串」解析
 			if nodeID <= 0 {
-				return actool.Errorf("finding_id 无效"), nil
+				return actool.Errorf("invalid finding_id"), nil
+			}
+			poe := 0
+			if a.PoELevel != nil {
+				poe = *a.PoELevel
+			}
+			if poe < 0 || poe > 4 {
+				return actool.Errorf(fmt.Sprintf("invalid poe_level %d (want 0-4)", poe)), nil
+			}
+			notFound := actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID))
+			findingID, err := s.m.pg.FindingIDByNodeID(nodeID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return notFound, nil
+			}
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == 0 {
-				return actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID)), nil
+				return notFound, nil
 			}
-			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
+			// The report is saved above; verification only decides the status. A
+			// downgrade is recorded and reported, never used to drop the report.
+			status, note := s.assessFindingVerification(ctx, findingID, poe, a.EvidenceQuotes)
+			if err := s.m.pg.SetFindingVerification(findingID, status, poe, note); err != nil {
+				return actool.Errorf("report saved, but verification not recorded: " + err.Error()), nil
+			}
+			msg := fmt.Sprintf("finding %d report updated (%d chars)\nverification: %s", nodeID, len(a.Report), status)
+			if status == db.VerificationVerified {
+				msg += fmt.Sprintf(" (POE L%d)", poe)
+			} else {
+				msg += " - " + note + "\nwarning: the report is saved but the finding is not verified. To reach verified, declare poe_level 3 or 4 and pass exact quotes copied from a bound proof/verification response body."
+			}
+			return actool.Text(msg), nil
 		})
 }
 
@@ -491,8 +524,10 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedPlannerDefaultBindings()
 	s.seedPlannerListAssetsBinding()
 	s.seedCompanyScopeRebind()
-	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
-	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
+	s.seedWorkerReadToolsUnbind()  // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
+	s.seedWorkerReadbackRebind()   // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
+	s.seedTaskCredentialBindings() // save/list_task_credential onto worker + pentest (one-time, #3)
+	s.healListTaskCredentialsSchema()
 	s.seedAutoReportFindingBinding()
 	s.unbindGoalMetDefault()
 	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
@@ -503,6 +538,8 @@ func (s *Server) seedOrchestrationTools() {
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
+	s.seedFindingVerificationSchema() // S1: poe_level / evidence_quotes on update_finding_report, added once per DB
+	s.seedFindingEvidenceSchema()     // optional counterevidence / confidence_rationale on report_finding, added once per DB
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
@@ -882,6 +919,37 @@ func (s *Server) seedWorkerReadToolsUnbind() {
 // they had been added to WorkerTools(), so any DB that ran that migration lost them.
 // Fresh DBs already have them via WorkerTools() and this is a harmless no-op there.
 // One-shot + flag-guarded so a user who later deliberately unbinds them isn't overridden.
+// seedTaskCredentialBindings binds the task-credential tools onto worker and
+// pentest ONCE (guarded by a settings flag), so existing DBs seeded before #3
+// still get them — fresh DBs already have them via WorkerTools()/the pentest
+// catalog seed. A user who deliberately unbinds them is not overridden.
+func (s *Server) seedTaskCredentialBindings() {
+	const flag = "task_credential_bindings_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	for _, agentKey := range []string{"worker", "pentest"} {
+		if err := s.m.pg.AddAgentToToolBinding(agentKey, []string{"save_task_credential", "list_task_credentials"}); err != nil {
+			log.Printf("[%s] task-credential default binding failed: %v", agentKey, err)
+			return // flag not set; retried on next startup
+		}
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// healListTaskCredentialsSchema repairs the list_task_credentials row seeded by
+// older builds, whose schema carried "required": [""] — strict providers reject
+// it, which fails every worker run. SeedTool is first-insert-only, so the code fix
+// alone never reaches an already-seeded row. Only that exact malformed value on
+// that one key matches, and only the "required" key is dropped: the rest of the
+// schema, the description, bindings and enabled flag are untouched. A healed row
+// no longer matches, so this needs no settings flag and is a no-op afterwards.
+func (s *Server) healListTaskCredentialsSchema() {
+	if _, err := s.m.pg.Exec(`UPDATE tools SET schema = schema - 'required', updated_at=now() WHERE key='list_task_credentials' AND schema->'required' = '[""]'::jsonb`); err != nil {
+		log.Printf("[tools] heal list_task_credentials schema failed: %v", err)
+	}
+}
+
 func (s *Server) seedWorkerReadbackRebind() {
 	const flag = "worker_readback_rebind_v2" // v2: 追加 node_detail
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {

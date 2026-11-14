@@ -1456,7 +1456,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       if (
         !intent ||
         intent.inherited ||
-        (intent.state !== "running" && intent.state !== "paused" && intent.state !== "open")
+        !["running", "paused", "open", "done", "blocked", "exhausted", "stopped"].includes(intent.state)
       ) {
         throw new Error("Worker 状态已变化");
       }

@@ -655,6 +655,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
+		// Task credentials (#3): reuse user-declared test accounts, record
+		// self-registered ones so they are not forgotten.
+		t.saveTaskCredential(), t.listTaskCredentials(),
 		// 跨 work 回看：worker 也可复用其他 work 的观察，避免重复劳动。
 		// search_all_worker_traces：不必先知道 intent_id，按关键字全局捞命中步骤；
 		// get_worker_trace：锁定某条 work 后列步骤/就地搜/取完整内容。
