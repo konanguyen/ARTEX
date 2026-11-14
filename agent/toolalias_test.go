@@ -110,11 +110,15 @@ func TestAddToolAliasesSkipsTaken(t *testing.T) {
 // agent base (DefaultTools) yields lowercase aliases that are callable by name,
 // while every alias schema is withheld via the deferred list.
 func TestAugmentToolsRegistersAliases(t *testing.T) {
-	oldPolicy, oldResolve, oldAugment := FindingTrafficBindingEnabled, ToolResolve, ToolAugment
-	t.Cleanup(func() { FindingTrafficBindingEnabled, ToolResolve, ToolAugment = oldPolicy, oldResolve, oldAugment })
-	ToolAugment = nil
-	ToolResolve = nil
-	FindingTrafficBindingEnabled = nil
+	oldPolicy, oldResolve, oldAugment := FindingTrafficBindingEnabled(), ToolResolve(), ToolAugment()
+	t.Cleanup(func() {
+		SetFindingTrafficBindingEnabled(oldPolicy)
+		SetToolResolve(oldResolve)
+		SetToolAugment(oldAugment)
+	})
+	SetToolAugment(nil)
+	SetToolResolve(nil)
+	SetFindingTrafficBindingEnabled(nil)
 
 	out, def, cleanup := AugmentTools(context.Background(), "worker", actool.DefaultTools())
 	defer cleanup()
