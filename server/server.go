@@ -357,14 +357,16 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	streaming := true // 旧库/新建默认流式
 	var maxTokens int
 	var maxTokensField string
-	var sessionHeaderKey string
+	sessionHeaderKey := cfg.SessionHeaderKey
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
 			if p.Name == "default" {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
-				sessionHeaderKey = p.SessionHeaderKey
+				if sessionHeaderKey == "" {
+					sessionHeaderKey = p.SessionHeaderKey
+				}
 				retry = p.Retry
 				break
 			}
@@ -1403,10 +1405,11 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 自定义会话头名照该配置来：非空则测试请求也发这个头(值为一次性随机 session id，
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
+	providerSessionHeaderKey := cfg.SessionHeaderKey
 	cfg.SessionHeaderKey = req.SessionHeaderKey
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
-	// 会话头名同理：表单未带时用已存 profile 的值兜底。
+	// 会话头名同理：表单未带时用已存 profile 的值兜底，再回落到 provider 默认值。
 	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
@@ -1416,6 +1419,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
 			}
 		}
+	}
+	// Request and saved-profile headers take precedence over provider defaults.
+	if cfg.SessionHeaderKey == "" {
+		cfg.SessionHeaderKey = providerSessionHeaderKey
 	}
 	if cfg.APIKey == "" {
 		s.cfgMu.Lock()

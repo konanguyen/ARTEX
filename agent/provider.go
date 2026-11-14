@@ -137,17 +137,18 @@ func compactionConfig(windowTokens int) *compaction.Config {
 
 // FromEnv resolves the LLM provider config:
 //
-//	ARTEX_LLM_PROVIDER = anthropic|openai (default: inferred from keys)
+//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|opencode-go (default: inferred from keys)
 //	ARTEX_LLM_MODEL    = model id        (default: per provider)
 //	ARTEX_LLM_BASE_URL = endpoint        (optional)
 //	ARTEX_LLM_PROXY    = proxy URL        (optional; http/https/socks5)
-//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials
+//	ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY = credentials
 func FromEnv() (Config, bool) {
 	// Case- and space-insensitive: "Ollama" used to miss every case below and
 	// fall through to anthropic, sending ANTHROPIC_API_KEY to the Ollama base URL.
 	prov := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_LLM_PROVIDER")))
 	anthKey := os.Getenv("ANTHROPIC_API_KEY")
 	oaiKey := os.Getenv("OPENAI_API_KEY")
+	opencodeKey := os.Getenv("OPENCODE_API_KEY")
 
 	if prov == "" {
 		switch {
@@ -155,6 +156,8 @@ func FromEnv() (Config, bool) {
 			prov = "anthropic"
 		case oaiKey != "":
 			prov = "openai"
+		case opencodeKey != "":
+			prov = "opencode-go"
 		default:
 			return Config{}, false
 		}
@@ -174,6 +177,8 @@ func FromEnv() (Config, bool) {
 		if c.Model == "" {
 			c.Model = "gpt-4o"
 		}
+	case "opencode-go":
+		c = applyOpenCodeGoDefaults(c, opencodeKey)
 	case "openai-responses":
 		c.Format = llm.FormatOpenAIResponses
 		c.APIKey = oaiKey
@@ -205,7 +210,7 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		Proxy:   strings.TrimSpace(proxy),
 		Stream:  true, // 默认流式;调用方按 profile 覆盖
 	}
-	switch strings.TrimSpace(provider) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
 		c.Format = llm.FormatOpenAI
 		// provider appends "/chat/completions"; tolerate a full endpoint URL.
@@ -213,6 +218,8 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "gpt-4o"
 		}
+	case "opencode-go":
+		c = applyOpenCodeGoDefaults(c, c.APIKey)
 	case "openai-responses":
 		c.Format = llm.FormatOpenAIResponses
 		// provider appends "/responses"; tolerate a full endpoint URL.
@@ -227,6 +234,27 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "claude-opus-4-8"
 		}
+	}
+	return c
+}
+
+// applyOpenCodeGoDefaults configures the OpenCode Go subscription gateway
+// (OpenAI-compatible at https://opencode.ai/zen/go/v1). Requests without
+// x-opencode-session fail with 400 MissingSessionID, and env mode must use
+// OPENCODE_API_KEY without ever falling back to OPENAI_API_KEY.
+func applyOpenCodeGoDefaults(c Config, apiKey string) Config {
+	c.Format = llm.FormatOpenAI
+	c.APIKey = strings.TrimSpace(apiKey)
+	c.SessionHeaderKey = "x-opencode-session"
+	c.BaseURL = strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+	if c.BaseURL == "" {
+		c.BaseURL = "https://opencode.ai/zen/go/v1"
+	} else {
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/chat/completions"), "/")
+	}
+	c.Model = strings.TrimSpace(c.Model)
+	if c.Model == "" {
+		c.Model = "glm-5.3-flash"
 	}
 	return c
 }
@@ -338,6 +366,9 @@ type quotaAwareTransport struct {
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, explicit := req.Header["User-Agent"]; !explicit {
+		req.Header.Set("User-Agent", "artex")
+	}
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what

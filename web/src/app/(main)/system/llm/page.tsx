@@ -28,10 +28,23 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
+import {
+  applyLLMProfilePreset,
+  isLLMProfilePresetId,
+  LLM_PROFILE_PRESET_IDS,
+  type LLMProfilePresetId,
+} from "@/lib/llm-profile-presets";
 import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
+
+const PRESET_LABELS: Record<LLMProfilePresetId, { labelKey: string; helpKey: string }> = {
+  "opencode-go": {
+    labelKey: "llm.preset.opencodeGo",
+    helpKey: "llm.preset.opencodeGoHelp",
+  },
+};
 
 // 思考开关(thinking.type)与思考强度(reasoning_effort)是两个【互相独立】的字段，
 // 各自单独设置——有些接口没有 thinking 字段、只靠强度参数就能激活思考，故需解耦。
@@ -339,11 +352,13 @@ function ProfileSheet({
   const [models, setModels] = React.useState<string[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [preset, setPreset] = React.useState<LLMProfilePresetId | "">("");
 
   // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
   // 就是一次干净的开始，不会留下上一个配置的残影。
   React.useEffect(() => {
     if (!open) return;
+    setPreset("");
     setName(profile?.name ?? "");
     setFormat(profile?.format === "openai" || profile?.format === "openai-responses" ? profile.format : "anthropic");
     setModel(profile?.model ?? "");
@@ -368,6 +383,23 @@ function ProfileSheet({
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+
+  function applyPreset(id: string) {
+    if (!isNew || !isLLMProfilePresetId(id)) return;
+    const next = applyLLMProfilePreset({ format, model, base_url: baseUrl }, id);
+    setPreset(id);
+    setFormat(next.format);
+    setModel(next.model);
+    setBaseUrl(next.base_url);
+    setThinkingType(fromStore(next.thinking_type));
+    setEffort(fromStore(next.reasoning_effort));
+    setCw(String(next.context_window_k));
+    setMaxTokens(String(next.max_tokens));
+    setMaxTokensField(fromStore(next.max_tokens_field));
+    if (next.session_header_key) setSessionHeaderKey(next.session_header_key);
+    setModels([]);
+    setModelsOpen(false);
+  }
 
   async function loadModels() {
     if (loadingModels) return;
@@ -485,6 +517,27 @@ function ProfileSheet({
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
+          {isNew && (
+            <div className="grid gap-2 rounded-md border bg-muted/20 p-3">
+              <Label htmlFor="p-preset">{t("llm.preset.title")}</Label>
+              <Select value={preset} onValueChange={applyPreset}>
+                <SelectTrigger id="p-preset" className="w-full min-w-0">
+                  <SelectValue placeholder={t("llm.preset.choose")} />
+                </SelectTrigger>
+                <SelectContent>
+                  {LLM_PROFILE_PRESET_IDS.map((id) => (
+                    <SelectItem key={id} value={id}>
+                      {t(PRESET_LABELS[id].labelKey)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-xs">{t("llm.preset.introduction")}</p>
+              {preset && (
+                <p className="text-muted-foreground text-xs">{t(PRESET_LABELS[preset].helpKey)}</p>
+              )}
+            </div>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
               <Label htmlFor="p-name">{t("llm.field.name")}</Label>

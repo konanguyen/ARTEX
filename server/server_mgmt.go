@@ -1972,13 +1972,70 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.llmPoolStatus())
 }
 
+type modelListCandidate struct {
+	url string
+	hdr http.Header
+}
+
+// modelListCandidates resolves ordered (URL, headers) candidates for fetching
+// a provider's model list. Responses API and OpenCode Go share OpenAI's /models path.
+func modelListCandidates(provider, baseURL, apiKey string) []modelListCandidate {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	prov := strings.ToLower(strings.TrimSpace(provider))
+
+	bearerHdr := func() http.Header {
+		h := http.Header{}
+		h.Set("Authorization", "Bearer "+apiKey)
+		h.Set("User-Agent", "artex")
+		return h
+	}
+	anthropicHdr := func() http.Header {
+		h := http.Header{}
+		h.Set("x-api-key", apiKey)
+		h.Set("anthropic-version", "2023-06-01")
+		h.Set("User-Agent", "artex")
+		return h
+	}
+
+	var candidates []modelListCandidate
+	switch prov {
+	case "openai", "openai-responses", "opencode-go":
+		// Responses API and OpenCode Go share the OpenAI model list at /models;
+		// tolerate a full endpoint URL of either format.
+		if baseURL == "" {
+			if prov == "opencode-go" {
+				baseURL = "https://opencode.ai/zen/go/v1"
+			} else {
+				baseURL = "https://api.openai.com/v1"
+			}
+		}
+		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
+		candidates = append(candidates, modelListCandidate{b + "/models", bearerHdr()})
+	default: // anthropic
+		if baseURL == "" {
+			baseURL = "https://api.anthropic.com"
+		}
+		b := strings.TrimRight(strings.TrimSuffix(baseURL, "/v1/messages"), "/")
+		candidates = append(candidates, modelListCandidate{b + "/v1/models", anthropicHdr()})
+		// Fallback for Anthropic-compatible third parties whose model list lives on
+		// the OpenAI path: strip a trailing /anthropic and try the OpenAI endpoint.
+		if root := strings.TrimRight(strings.TrimSuffix(b, "/anthropic"), "/"); root != b {
+			candidates = append(candidates,
+				modelListCandidate{root + "/models", bearerHdr()},
+				modelListCandidate{root + "/v1/models", bearerHdr()},
+			)
+		}
+	}
+	return candidates
+}
+
 // pgListModels fetches available models from the provider's API endpoint.
 // Supports OpenAI-format (GET /models) and Anthropic-format (GET /v1/models); for
 // Anthropic-compatible third parties (e.g. DeepSeek) whose model list lives only on
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
+		Provider  string `json:"provider"` // "openai" | "openai-responses" | "opencode-go" | "anthropic"
 		BaseURL   string `json:"base_url"`
 		APIKey    string `json:"api_key"`
 		Proxy     string `json:"proxy"`
@@ -2007,47 +2064,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
 	// the model list only on their OpenAI-format path — so for anthropic we fall
 	// back to the OpenAI endpoint at the stripped root.
-	type candidate struct {
-		url string
-		hdr http.Header
-	}
-	bearerHdr := func() http.Header {
-		h := http.Header{}
-		h.Set("Authorization", "Bearer "+apiKey)
-		return h
-	}
-	anthropicHdr := func() http.Header {
-		h := http.Header{}
-		h.Set("x-api-key", apiKey)
-		h.Set("anthropic-version", "2023-06-01")
-		return h
-	}
-
-	var candidates []candidate
-	switch provider {
-	case "openai", "openai-responses":
-		// Responses API shares the OpenAI model list at /v1/models; tolerate a full
-		// endpoint URL of either format.
-		if baseURL == "" {
-			baseURL = "https://api.openai.com/v1"
-		}
-		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
-		candidates = append(candidates, candidate{b + "/models", bearerHdr()})
-	default: // anthropic
-		if baseURL == "" {
-			baseURL = "https://api.anthropic.com"
-		}
-		b := strings.TrimRight(strings.TrimSuffix(baseURL, "/v1/messages"), "/")
-		candidates = append(candidates, candidate{b + "/v1/models", anthropicHdr()})
-		// Fallback for Anthropic-compatible third parties whose model list lives on
-		// the OpenAI path: strip a trailing /anthropic and try the OpenAI endpoint.
-		if root := strings.TrimRight(strings.TrimSuffix(b, "/anthropic"), "/"); root != b {
-			candidates = append(candidates,
-				candidate{root + "/models", bearerHdr()},
-				candidate{root + "/v1/models", bearerHdr()},
-			)
-		}
-	}
+	candidates := modelListCandidates(provider, baseURL, apiKey)
 
 	// Build HTTP client with optional proxy.
 	transport := &http.Transport{}
