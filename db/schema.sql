@@ -564,6 +564,8 @@ CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- planner 心跳触发间隔(秒);补旧库。默认 300s(5min)。见 docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
+-- Approval gate for asset targets, opt-in per task; backfills old databases. false (default) = no gate, behaviour unchanged.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_rotate BOOLEAN NOT NULL DEFAULT false;
 -- 并发上限挂起态;补旧库。true=因并发上限排队、等待空位自动启动。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false;
@@ -991,6 +993,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS exploration_id BIGINT UNIQUE REFERENCES explorations(id) ON DELETE SET NULL;
+-- Approval gate for asset targets, opt-in per conversation (a chat has no task). false (default) = no gate.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_conversations_llm_profile ON conversations(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at DESC) WHERE pinned_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_conversations_upd ON conversations;
@@ -1118,6 +1122,55 @@ UPDATE intercept_pending SET decision_source='model'
 -- existed) | human | rule | model | system. No backfill: readers fall back to
 -- decision_source for legacy rows instead of rewriting history.
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
+-- Target approval requests. target_key = '<host>:<port>' of the asset target the row asks for;
+-- NULL = classic ask (and every row that predates the column). At most one open request per
+-- scope (task or conversation) and target: concurrent calls to one host share one row.
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS target_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intercept_pending_target
+    ON intercept_pending (COALESCE(task_id,''), COALESCE(conversation_id,0), target_key)
+    WHERE status = 'pending' AND target_key IS NOT NULL;
+
+-- Target pins: host + port approved by a human for one task or one conversation, with the
+-- addresses shown at approval time. Written only by the decide endpoint. No foreign keys on
+-- task_id, conversation_id and intercept_id: a pin outlives its task, its conversation and its
+-- request row as history (revoked, never deleted). status and revoked_reason carry no CHECK
+-- (validated in Go, same convention as findings.status).
+CREATE TABLE IF NOT EXISTS target_pins (
+    id              BIGSERIAL PRIMARY KEY,
+    task_id         BIGINT,
+    conversation_id BIGINT,
+    host            TEXT NOT NULL,                  -- normalised name, IP literal or CIDR
+    port            INTEGER NOT NULL DEFAULT 0,     -- 0 = port not declared: covers every port of the host
+    version         INTEGER NOT NULL DEFAULT 1,
+    pinned_ips      TEXT[] NOT NULL DEFAULT '{}',   -- canonical, sorted
+    resolver        TEXT NOT NULL DEFAULT '',
+    resolved_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status          TEXT NOT NULL DEFAULT 'active', -- active | superseded | revoked
+    intercept_id    BIGINT,                         -- the request row that carried the click
+    decided_by      TEXT NOT NULL DEFAULT '',       -- approver: subject of the session token
+    decided_from    TEXT NOT NULL DEFAULT '',       -- remote address of the click
+    -- Approved while the upstream egress proxy was set: the proxy chooses the address, so the
+    -- pin covers the name only and its addresses are not compared. Stays true if the proxy is
+    -- removed later; enforcing addresses again takes a new approval.
+    name_only_effective BOOLEAN NOT NULL DEFAULT false,
+    revoked_at      TIMESTAMPTZ,
+    revoked_reason  TEXT NOT NULL DEFAULT '',       -- operator | task_deleted | conversation_deleted
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_target_pins_active
+    ON target_pins (COALESCE(task_id,0), COALESCE(conversation_id,0), host, port)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_target_pins_scope ON target_pins (task_id, conversation_id, status);
+
+-- Append-only history of the target-gate exemption list (settings key target_gate_exempt_hosts).
+CREATE TABLE IF NOT EXISTS target_gate_exemption_log (
+    id          BIGSERIAL PRIMARY KEY,
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_by  TEXT NOT NULL DEFAULT '',
+    before      JSONB,
+    after       JSONB,
+    digest      TEXT NOT NULL DEFAULT ''
+);
 
 -- =====================================================================
 -- L. 漏洞发现持久化

@@ -49,7 +49,7 @@ func TestPlannerWithdrawalSurvivesTriggerFreeRound(t *testing.T) {
 		{{Kind: "cancelled", IntentID: intent, Summary: "withdrawn worker", Detail: reason}},
 		nil,
 	} {
-		if _, _, err := planner.Plan(ctx, row.ID, d.Assets(), ts, row.Goal, triggers, nil); err != nil {
+		if _, _, err := planner.Plan(ctx, row.ID, d.Assets(), ts, row.Goal, triggers, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

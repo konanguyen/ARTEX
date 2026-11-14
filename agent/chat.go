@@ -82,6 +82,9 @@ func chatWorkDirSpec(workDir string) string {
 }
 
 // chatSystem preserves the role default if its stored template is missing or invalid.
+// Every chat agent, built-in or custom, can read target-derived content through
+// WebFetch or Bash, so all of them get the code-owned untrusted-content tail
+// after the editable body.
 func chatSystem(agentKey, dataDir, workDir string) string {
 	def := DefaultAssistantPrompt
 	switch agentKey {
@@ -94,7 +97,9 @@ func chatSystem(agentKey, dataDir, workDir string) string {
 	case "retester":
 		def = RetesterDefaultPrompt
 	}
-	return renderSystem(agentKey, def, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir) + noiseProfileBlock()
+	body := renderSystem(agentKey, def, chatVars{DataDir: dataDir, Now: nowStr()})
+	body += untrustedContentTail(body)
+	return body + chatWorkDirSpec(workDir) + noiseProfileBlock()
 }
 
 func (c *ChatAgent) nativeOllama() bool {
@@ -145,13 +150,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		Provider:        c.prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
-		Tools:           tools,
+		Tools:           withWebFetch(ctx, tools, c.proxyAddr, c.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
-		WebFetchProxy:   c.proxyAddr,
-		WebFetchCACert:  c.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
 		EnableWebSearch:       ws.Enabled,
@@ -176,6 +178,9 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		Settlement:   wrapupSettlement(agentKey, nil),
 		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+
+		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
+		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()

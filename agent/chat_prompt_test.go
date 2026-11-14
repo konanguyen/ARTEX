@@ -30,7 +30,9 @@ func TestChatPromptPreservesRoleOnMissingOrInvalidTemplate(t *testing.T) {
 			t.Run(role+"/"+tc.name, func(t *testing.T) {
 				PromptOverride = func(string) (string, bool) { return tc.body, tc.exists }
 				got := chatSystem(role, "/data", "/work")
-				want := fallback + chatWorkDirSpec("/work")
+				// The code-owned untrusted-content tail and the noise-profile block
+				// follow the rendered body (F6/F13 tails, this port's egress block).
+				want := fallback + untrustedContentTail(fallback) + chatWorkDirSpec("/work") + noiseProfileBlock()
 				if got != want {
 					t.Fatal("chat lost its role default or file output rules")
 				}
@@ -39,7 +41,7 @@ func TestChatPromptPreservesRoleOnMissingOrInvalidTemplate(t *testing.T) {
 		t.Run(role+"/edited template", func(t *testing.T) {
 			PromptOverride = func(string) (string, bool) { return "EDITED {{.DataDir}} {{.Now}}", true }
 			got := chatSystem(role, "/data", "/work")
-			if !strings.HasPrefix(got, "EDITED /data ") || strings.Contains(got, "{{") || !strings.HasSuffix(got, chatWorkDirSpec("/work")) {
+			if !strings.HasPrefix(got, "EDITED /data ") || strings.Contains(got, "{{") || !strings.HasSuffix(got, chatWorkDirSpec("/work")+noiseProfileBlock()) {
 				t.Fatal("valid edited prompt was not rendered intact")
 			}
 		})

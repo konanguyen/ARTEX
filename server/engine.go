@@ -795,6 +795,19 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// plannerGateContext tags a planning round's context for the target gate: the
+// task, the "planner" lane (so an approval request raised from the round shows
+// inline in the planner transcript) and the approval scope. wait bounds how long
+// a gated call may wait for a human decision.
+func (e *Engine) plannerGateContext(ctx context.Context, t *Task, wait time.Duration) context.Context {
+	emit := func(a db.Activity) {
+		a.Worker = "planner"
+		e.emitActivity(t, a)
+	}
+	ctx = intercept.WithTaskContext(ctx, t.ID, "planner", emit)
+	return intercept.WithTargetScope(ctx, t.targetScope(wait))
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -879,9 +892,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
-		pctx := e.budgetRoundCtx(ectx, t, false)
+		pctx := e.plannerGateContext(e.budgetRoundCtx(ectx, t, false), t, intercept.DefaultTargetWaitBound)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
@@ -1090,6 +1103,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// Run budget (off by default): meter this run's calls; its effective budget is
 	// min(intent budget, task remaining above the wrap-up reserve).
 	workCtx, meter := e.budgetIntent(workCtx, t.ID)
+	workCtx = intercept.WithTargetScope(workCtx, t.targetScope(intercept.DefaultTargetWaitBound))
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{

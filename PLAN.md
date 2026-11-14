@@ -165,7 +165,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - `ARTEX_TOOL_RAG` (`agent/toolrag.go`): lọc từ vựng danh sách công cụ gắn cho agent, chỉ giữ lại các công cụ cốt lõi và top-K công cụ phù hợp nhất với nhiệm vụ để tiết kiệm token.
   - **File chính**: `egress/egress.go`, `agent/webfetch.go`, `agent/noise_profile.go`, `agent/toolrag.go`.
 
-- [ ] **5.4. Target Gate (`S3b`) & Chống Prompt Injection / Agentic Guards (`BaaRai #166, #177–#186, #189, #190, #194–#198, #203`)** ⚠️ **`[Chạm Prompt]`**
+- [x] **5.4. Target Gate (`S3b`) & Chống Prompt Injection / Agentic Guards (`BaaRai #166, #177–#186, #189, #190, #194–#198, #203`)** ⚠️ **`[Chạm Prompt]`**
   - **Mô tả**:
     - Bọc đầu ra của công cụ bằng ranh giới dữ liệu không tin cậy (`ARTEX_UNTRUSTED_BOUNDARY`) và đóng khung các trường do agent sinh ra bằng nonce envelope (`agent/data_envelope.go`).
     - Gắn nguồn gốc dữ kiện `record_fact` (`origin` do server xác định), buộc `prove_goal` phải dùng fact có độ tin cậy `observed`, chặn `goal_met` khi còn goal mở, áp dụng rule `[built-in]` deny cho cả `planner` và `main agent`.

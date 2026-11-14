@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -76,6 +77,39 @@ func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 	return f
 }
 
+// targetScopeCtxKey is a separate unexported key type for the target-gate scope.
+type targetScopeCtxKey struct{}
+
+// DefaultTargetWaitBound is how long a gated tool call may wait for a human
+// decision on an unpinned target before it fails with the request left open.
+const DefaultTargetWaitBound = 300 * time.Second
+
+// TargetScope is what an approval for an asset target is bound to: one task
+// (TaskID) or one conversation (ConversationID), never both. Enabled reports the
+// scope's opt-in flag and is read on every gated call; nil means the gate is off.
+// WaitBound caps the wait for a human decision; 0 means never wait.
+// Interceptor is the one that owns the gate of this session, so that code
+// holding only a context (an HTTP redirect callback) can reach it.
+type TargetScope struct {
+	TaskID         string
+	ConversationID int64
+	Enabled        func() bool
+	WaitBound      time.Duration
+	Interceptor    *Interceptor
+}
+
+// WithTargetScope returns a child context carrying the target-gate scope of the
+// session that runs on it.
+func WithTargetScope(ctx context.Context, s TargetScope) context.Context {
+	return context.WithValue(ctx, targetScopeCtxKey{}, s)
+}
+
+// TargetScopeFromContext extracts the target-gate scope (ok is false if absent).
+func TargetScopeFromContext(ctx context.Context) (s TargetScope, ok bool) {
+	s, ok = ctx.Value(targetScopeCtxKey{}).(TargetScope)
+	return s, ok
+}
+
 // compiledRule is an InterceptRule with the regex pre-compiled (nil for string rules)
 // and the argv tokens pre-parsed (nil for non-argv rules).
 type compiledRule struct {
@@ -105,36 +139,52 @@ func compileRule(r db.InterceptRule) (compiledRule, bool) {
 	return cr, true
 }
 
-// pendingManager tracks in-flight "ask" requests via per-request channels.
+// pendingManager tracks in-flight approval requests via per-waiter channels. A
+// classic ask has one waiter; a target request can have several (every call
+// that names the same host waits on the same row).
 type pendingManager struct {
 	mu sync.Mutex
-	ch map[int64]chan bool
+	ch map[int64][]chan bool
 }
 
-func newPendingManager() *pendingManager { return &pendingManager{ch: map[int64]chan bool{}} }
+func newPendingManager() *pendingManager { return &pendingManager{ch: map[int64][]chan bool{}} }
 
+// add registers one more waiter for id and returns its channel.
 func (p *pendingManager) add(id int64) chan bool {
 	ch := make(chan bool, 1)
 	p.mu.Lock()
-	p.ch[id] = ch
+	p.ch[id] = append(p.ch[id], ch)
 	p.mu.Unlock()
 	return ch
 }
 
+// resolve wakes every waiter of id with the decision.
 func (p *pendingManager) resolve(id int64, allowed bool) {
 	p.mu.Lock()
-	ch, ok := p.ch[id]
+	waiters := p.ch[id]
 	delete(p.ch, id)
 	p.mu.Unlock()
-	if ok {
+	for _, ch := range waiters {
 		ch <- allowed
 	}
 }
 
-func (p *pendingManager) remove(id int64) {
+// remove takes one waiter's channel out; the other waiters of id stay.
+func (p *pendingManager) remove(id int64, ch chan bool) {
 	p.mu.Lock()
-	delete(p.ch, id)
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	waiters := p.ch[id]
+	for n, w := range waiters {
+		if w == ch {
+			waiters = append(waiters[:n:n], waiters[n+1:]...)
+			break
+		}
+	}
+	if len(waiters) == 0 {
+		delete(p.ch, id)
+		return
+	}
+	p.ch[id] = waiters
 }
 
 // Reviewer runs the LLM fallback judge for one tool call and returns its verdict
@@ -158,6 +208,30 @@ type Interceptor struct {
 	pending      *pendingManager
 	reviewer     Reviewer  // nil = freeform LLM fallback judge not wired
 	completer    Completer // nil = closed-question judge not wired
+	// upstreamProxy reports whether target traffic leaves through an upstream
+	// egress proxy (nil = no). Injected by the server layer.
+	upstreamProxy func() bool
+	// derivedExempt lists the endpoints of the platform's own services (nil =
+	// none). Injected by the server layer. See SetDerivedExemptions.
+	derivedExempt func() []string
+	// targets is what the target gate reads and writes; resolve resolves the
+	// names it checks. firstUse holds the exemptions and pin versions whose first
+	// use this process has logged.
+	targets  targetStore
+	resolve  *resolveCache
+	firstUse sync.Map
+	// dial is the base dialer of PinnedDialer: every connection it lets through
+	// is opened here. See SetBaseDialer.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// SetUpstreamProxyCheck installs the function that reports whether an upstream
+// egress proxy is configured. Behind one the proxy chooses the address it
+// connects to, so a target approval given while it is set is name-only.
+func (i *Interceptor) SetUpstreamProxyCheck(f func() bool) {
+	i.mu.Lock()
+	i.upstreamProxy = f
+	i.mu.Unlock()
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -185,7 +259,8 @@ var defaultEnabledTools = []string{
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
-	return &Interceptor{db: d, pending: newPendingManager()}
+	return &Interceptor{db: d, pending: newPendingManager(),
+		targets: dbTargetStore{d}, resolve: newResolveCache(systemResolver{}), dial: baseDial}
 }
 
 // Invalidate clears the in-memory rule cache and the enabled-tools cache.
@@ -668,6 +743,49 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	return Decision{}, false
 }
 
+// builtinRulePrefix marks the rules seeded by the platform (db.seedDefaultInterceptRules
+// and its v2/v3 migrations).
+const builtinRulePrefix = "[内置]"
+
+// MatchBuiltin is Match restricted to the built-in deny rules: the enabled rules
+// whose name starts with "[内置]" and whose action is deny, on the tools that
+// enter the rule system. It returns the first match in priority order. User rules,
+// allow and ask rules, and the judge are not consulted. The planner and the main
+// agent use it (#124, F11). An interceptor without a database and without loaded
+// rules matches nothing.
+func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, bool) {
+	i.mu.RLock()
+	loaded := i.cached != nil
+	i.mu.RUnlock()
+	if !loaded && i.db == nil {
+		return Decision{}, false
+	}
+	if !i.IsToolEnabled(toolName) {
+		return Decision{}, false
+	}
+	rules, err := i.rules()
+	if err != nil {
+		return Decision{}, false
+	}
+	for _, r := range rules {
+		if r.Action != "deny" || !strings.HasPrefix(r.Name, builtinRulePrefix) || !ruleMatches(r, toolName, input) {
+			continue
+		}
+		msg := r.Message
+		if msg == "" {
+			msg = defaultMessage(r.Action, r.Name)
+		}
+		configJSON, _ := json.Marshal(r.InterceptRule)
+		return Decision{
+			RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+			Action:  r.Action,
+			Message: msg,
+			RuleID:  r.ID,
+		}, true
+	}
+	return Decision{}, false
+}
+
 // SetRulesForTest installs rules (in priority order) as the loaded rule set, with
 // the default intercept-enabled tools, on an interceptor that may have no
 // database. It is a test seam for the guard package, which cannot reach the
@@ -768,7 +886,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 
 	i.bindResult(ctx, pendingID, audit)
 	ch := i.pending.add(pendingID)
-	defer i.pending.remove(pendingID)
+	defer i.pending.remove(pendingID, ch)
 	// Polling clients can decide after INSERT commits but before the channel is
 	// registered. Re-read after registration so that decision cannot be lost;
 	// later decisions will be delivered through ch.
@@ -842,7 +960,11 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 var ErrAlreadyDecided = errors.New("Approval already handled or does not exist, please refresh records")
 
 // Decide resolves a pending request. Called by the HTTP decide endpoint.
-func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
+// approver (subject of the session token) and remoteAddr identify the human
+// behind the decision; they are recorded in the row's audit. On a target
+// request "allowed" also pins the addresses the request displayed, and both
+// values go to the pin: a human decision is the only thing that creates a pin.
+func (i *Interceptor) Decide(pendingID int64, allowed bool, approver, remoteAddr string) error {
 	status := "denied"
 	if allowed {
 		status = "allowed"
@@ -851,7 +973,16 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	if allowed {
 		action, reason = "allow", "Manual execution allowed"
 	}
-	resolved, err := i.db.ResolveIntercept(pendingID, status, action, reason, "human")
+	targetKey, err := i.db.TargetRequestKey(pendingID)
+	if err != nil {
+		return err
+	}
+	var resolved bool
+	if targetKey != "" {
+		_, resolved, err = i.db.ResolveTargetRequest(pendingID, allowed, approver, remoteAddr)
+	} else {
+		resolved, err = i.db.ResolveInterceptBy(pendingID, status, action, reason, "human", approver, remoteAddr)
+	}
 	if err != nil {
 		return err
 	}

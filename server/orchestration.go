@@ -13,6 +13,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -168,8 +169,8 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	if s.m.Assets() != nil {
 		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
 	}
-	tsx.SetNotify(t.Notify)         // 通用唤醒（无专用回调的写操作走它；读工具为 no-op）
-	tsx.SetNotifyHint(t.NotifyHint) // add_hint → 记一条「人新增了 N 条战略提示：…」触发并唤醒 planner
+	tsx.SetNotify(t.Notify)         // generic wake-up (write ops without a dedicated callback go through it; no-op for read tools)
+	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records an "orchestrator added N strategic hints: ..." entry and wakes the planner
 	return pick(tsx).Call(ctx, inner, nil)
 }
 
@@ -253,7 +254,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "可选：planner 心跳触发间隔(秒)。距上轮规划结束/任务开始满该值且期间无触发 → 触发一轮规划(兜底死锁 + 唤醒去监督飞行中的 worker)。留空或 0 = 默认 600(10min)；"},
 			"seed_first_intent":      map[string]any{"type": "boolean", "description": "可选：对于简单任务可开启，创建时直接下发一条种子意图(内容=描述+目标)让 worker 免等首轮 planner 直接开跑测试；默认 false(走标准先规划再执行)。"},
 		}, "description", "goal"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Description          string          `json:"description"`
 				Goal                 string          `json:"goal"`
@@ -307,11 +308,32 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
+			// Target gate: a child spawned from a gated scope is gated too, and keeps
+			// the block rules of the calling task. Read from the caller's scope, never
+			// from parent_ref (optional and written by the model). Pins and allow rules
+			// are never copied. Gate-off caller or no scope: created as before.
+			var gate *bool
+			var blockRules []db.TaskInterceptRuleInput
+			if scope, ok := intercept.TargetScopeFromContext(ctx); ok && scope.Enabled != nil && scope.Enabled() {
+				on := true
+				gate = &on
+				if callerID, err := strconv.ParseInt(scope.TaskID, 10, 64); err == nil && callerID > 0 {
+					block, _, err := s.m.Assets().TaskInterceptRulesSplit(callerID)
+					if err != nil {
+						return actool.Errorf("read the block rules of the calling task: " + err.Error()), nil
+					}
+					for _, r := range block {
+						blockRules = append(blockRules, db.TaskInterceptRuleInput{Enabled: r.Enabled, Action: r.Action, Kind: r.Kind, Pattern: r.Pattern, Note: r.Note})
+					}
+				}
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				InterceptRules:       blockRules,
+				TargetGate:           gate,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -540,9 +562,45 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedFindingWorkflowTools()
 	s.seedFindingVerificationSchema() // S1: poe_level / evidence_quotes on update_finding_report, added once per DB
 	s.seedFindingEvidenceSchema()     // optional counterevidence / confidence_rationale on report_finding, added once per DB
+	s.seedFactSourceSchema() // source enum on record_fact, added once per DB
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
+}
+
+// seedFactSourceSchema adds the source property (closed enum) to the record_fact
+// schema of existing databases (SeedTool is first-insert only, and ToolResolve
+// serves the stored schema, so without this the model would never see the enum).
+// Idempotent: the property is added only when the stored schema lacks it, and user
+// edits are preserved.
+func (s *Server) seedFactSourceSchema() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "record_fact" {
+			continue
+		}
+		raw, err := json.Marshal(seed.Schema)
+		if err != nil {
+			log.Printf("[facts] record_fact schema: %v", err)
+			return
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return
+		}
+		var properties map[string]json.RawMessage
+		if err := json.Unmarshal(obj["properties"], &properties); err != nil {
+			return
+		}
+		if len(properties["source"]) == 0 {
+			return
+		}
+		_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties','source'],$1::jsonb,true),updated_at=now()
+WHERE key='record_fact' AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? 'source')`, string(properties["source"]))
+		if err != nil {
+			log.Printf("[facts] upgrade record_fact.source: %v", err)
+		}
+		return
+	}
 }
 
 // refreshBuiltinToolSchemas propagates code schema/description changes on the

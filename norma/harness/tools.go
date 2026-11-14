@@ -106,6 +106,9 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	// output a tool already spilled/truncated carries a marker and is left
 	// untouched, so this never double-truncates or double-spills.
 	res = capOutput(tc, res)
+	if l.in.UntrustedOutputBoundary {
+		res = frameUntrustedResult(res)
+	}
 
 	if l.in.Hooks != nil {
 		raw, _ := json.Marshal(res.Flatten())

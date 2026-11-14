@@ -187,12 +187,13 @@ type ToolSet struct {
 	// goals decomposer (round-0 has no running planner to inform) and workers → those
 	// fall back to the bare notify.
 	notifyGoal func(texts []string)
-	// notifyHint, if set, wakes the planner AND records ONE "人新增了 N 条战略提示：…"
+	// notifyHint, if set, wakes the planner AND records ONE "<来源> 新增了 N 条战略提示：…"
 	// trigger for a whole add_hint call (batch-aware — one call, one trigger) so the next
 	// round is told the round was fired by a new hint and spells the hint out, instead of
-	// the planner having to spot it folded into the graph overview. Wired for the main
-	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
-	notifyHint func(texts []string)
+	// the planner having to spot it folded into the graph overview. origin 是 ToolSet 的
+	// worker（human / orchestrator / agent 名）。Wired for the main agent + cross-task
+	// orchestration; nil elsewhere → falls back to the bare notify.
+	notifyHint func(origin string, texts []string)
 }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
@@ -202,7 +203,7 @@ func (t *ToolSet) SetNotifyGoal(fn func([]string)) { t.notifyGoal = fn }
 // SetNotifyHint wires the hint-add trigger callback (see ToolSet.notifyHint). Set by
 // the main-agent chat and cross-task orchestration, so a runtime-added hint fires a
 // planner round announced by name instead of a bare wake.
-func (t *ToolSet) SetNotifyHint(fn func([]string)) { t.notifyHint = fn }
+func (t *ToolSet) SetNotifyHint(fn func(string, []string)) { t.notifyHint = fn }
 
 // SetResumeTask wires the task-revive callback (see ToolSet.resumeTask). Set only by
 // the main-agent chat, so runtime-added goals can pull a finished task back to running.
@@ -219,7 +220,7 @@ func (t *ToolSet) SetNotifyFinding(fn func(int64, string)) { t.notifyFinding = f
 // enrich). Kept as an interface here to avoid coupling agent → enrich.
 type EnrichTrigger interface {
 	ResolveDomain(id int64, host string)
-	ProbeSite(id int64, url string)
+	ProbeSite(ctx context.Context, id int64, url string)
 }
 
 // WriteCounts breaks down what a worker persisted this run, by node kind, so the
@@ -464,7 +465,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		// origin lets the user-message renderers keep the operator's own hints
+		// outside the data envelope (#124, F3).
+		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -570,7 +573,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["finding_list"] = findingList
 	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
 	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
-	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
+	// confidence?, origin?, source?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
 	for _, n := range factNodes {
@@ -580,7 +583,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		if hidden(n.ID) {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
 		}
-		m := compactNode(n)
+		m := compactFact(n) // summary capped at factSummaryMax (#124, F3)
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本事实由哪个意图产生
 		}
@@ -987,11 +990,19 @@ func inheritedIntentSummaryState(state string) bool {
 }
 
 // compactNode distills any exploration node to id + summary + state, dropping the
-// big detail/evidence (fetch that on demand via node_detail).
+// big detail/evidence (fetch that on demand via node_detail). It also carries the
+// provenance (#124, F4): origin is the writer recorded by the server (worker-N,
+// planner, human, orchestrator), source is the declared source of a fact.
 func compactNode(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
 	m := map[string]any{"id": n.ID, "state": n.State, "summary": p["summary"]}
+	if n.Origin != "" {
+		m["origin"] = n.Origin
+	}
+	if s, ok := p["source"].(string); ok && s != "" {
+		m["source"] = s
+	}
 	if n.Inherited {
 		inheritedMap(m, n.SourceTaskID)
 	}
@@ -1054,7 +1065,7 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 const factsPageSize = 20
 
 func (t *ToolSet) listFacts() actool.CoreTool {
-	return t.readExpTool("list_facts", "分页列本任务及直接关联任务的【探索事实/结论】，最新在前(紧凑：id+摘要+状态，摘要过长会截断，全文用 node_detail(id))。参数均可选：limit(默认 20，上限 100)、before(游标，传上一页返回的 next_before 取更旧的一页；省略/0=最新一页)、q(按摘要关键词过滤)。返回 {facts, total, has_more, next_before}：total 是过滤后的总数，has_more=true 时用 next_before 继续翻页。关联任务条目带 source_task_id/inherited=true 且只读。漏洞看 list_findings。",
+	return t.readExpTool("list_facts", "分页列本任务及直接关联任务的【探索事实/结论】，最新在前(紧凑：id+摘要+状态+origin(写入者)+source(内容声明来源)，摘要过长会截断，全文用 node_detail(id))。参数均可选：limit(默认 20，上限 100)、before(游标，传上一页返回的 next_before 取更旧的一页；省略/0=最新一页)、q(按摘要关键词过滤)。返回 {facts, total, has_more, next_before}：total 是过滤后的总数，has_more=true 时用 next_before 继续翻页。关联任务条目带 source_task_id/inherited=true 且只读。漏洞看 list_findings。",
 		obj(map[string]any{
 			"limit":  intp("返回条数，默认 20，上限 100"),
 			"before": intp("分页游标：只返回 id 小于该值的更旧事实；省略或 0 = 最新一页"),
@@ -1090,13 +1101,15 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 		})
 }
 
-// factSummaryMax caps a fact summary in list_facts output. Facts carry one-line
-// conclusions, but nothing enforces brevity; a runaway summary must not bloat a
-// whole page. Full text stays available via node_detail(id).
+// factSummaryMax caps a fact summary in list_facts output and in the overview's
+// recent_facts (#124, F3). Facts carry one-line conclusions, but nothing enforces
+// brevity; a runaway summary must not bloat a whole page, nor carry a long
+// payload into every planner and worker message. Full text stays available via
+// node_detail(id).
 const factSummaryMax = 160
 
-// compactFact is compactNode with the summary rune-capped for list_facts, so a
-// page of facts stays bounded regardless of how long any single summary grew.
+// compactFact is compactNode with the summary rune-capped for list_facts and
+// recent_facts, so they stay bounded regardless of how long any summary grew.
 func compactFact(n *db.Node) map[string]any {
 	m := compactNode(n)
 	if s, ok := m["summary"].(string); ok && len([]rune(s)) > factSummaryMax {
@@ -1272,7 +1285,7 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 }
 
 func (t *ToolSet) proveGoal() actool.CoreTool {
-	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
+	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。只有 confidence 为 observed（工具输出里直接看到）且 source 不是 target_response 的事实才能作为证据；其余（inferred、无 confidence、或目标自身返回的内容）都会被拒绝，目标保持 open。",
 		obj(map[string]any{
 			"goal_id":     idp("目标节点 id"),
 			"evidence_id": idp("证明它的发现/事实节点 id"),
@@ -1296,6 +1309,25 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			// A fact proves a goal only when it was seen directly (#124, F5): an inferred
+			// conclusion, or one without a confidence, is refused and the goal stays open.
+			// The confidence is declared by the agent that recorded the fact.
+			if evidenceNode.Kind == db.KindFact {
+				var fp map[string]any
+				_ = json.Unmarshal(evidenceNode.Payload, &fp)
+				confidence, _ := fp["confidence"].(string)
+				if strings.ToLower(strings.TrimSpace(confidence)) != "observed" {
+					if confidence == "" {
+						confidence = "none"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding or with an observed fact.", ev, confidence, goal)), nil
+				}
+				// A fact whose declared source is the target's own response is not
+				// authoritative (#124, F4): the target could have planted it.
+				if source, _ := fp["source"].(string); strings.ToLower(strings.TrimSpace(source)) == factSourceTargetResponse {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding or with an observed fact from another source.", ev, goal)), nil
+				}
 			}
 			if err := t.ts.ProveGoal(goal, ev); err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -1321,11 +1353,26 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
+	return t.writeExpTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// goal_met ends the task only when no goal node is open (#124, F5). A task
+			// without goal nodes keeps the old behavior.
+			goals, err := t.ts.ListByKind(db.KindGoal, 1000)
+			if err != nil {
+				return actool.Errorf("goal_met refused: the goals of this task could not be read (" + err.Error() + "); the task stays open"), nil
+			}
+			open := 0
+			for _, g := range goals {
+				if g.State != "met" {
+					open++
+				}
+			}
+			if open > 0 {
+				return actool.Errorf(fmt.Sprintf("goal_met refused: %d of %d goals of this task are still open; the task stays open. Prove each one with prove_goal(goal_id, evidence_id, reason): the task completes automatically when its last goal is marked met.", open, len(goals))), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
@@ -1569,7 +1616,9 @@ type hintItem struct {
 	TrafficRefs []db.TrafficRef   `json:"traffic_refs"`
 }
 
-// addOneHint 挂一条 hint 节点(active/human)到探索图,可锚定资产,返回 id。
+// addOneHint attaches a hint node (active) to the exploration graph, optionally
+// anchored to assets; returns the id. Its origin is t.worker, the agent that wrote
+// it: "human" for the main-agent chat, "orchestrator" for cross-task orchestration.
 func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(it.TrafficRefs) > 0 && !findingTrafficBindingEnabled() {
 		return 0, fmt.Errorf("Agent 自动绑定流量已关闭，未保存携带 traffic_refs 的提示；可在系统设置开启，或仅交接文字")
@@ -1591,9 +1640,10 @@ func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(refs) > 0 {
 		payload["traffic_refs"] = refs
 	}
-	// 唤醒 planner 不在此处逐条做——由 addHint 在整批写完后统一触发一次（带上提示文本），
-	// 避免一次 add_hint 多条提示逐条刷屏 planner 的触发行。
-	return t.ts.AddNode(db.KindHint, payload, 0, "active", "human", anchors)
+	// Waking the planner is not done here per item — addHint fires it once after the
+	// whole batch is written (carrying the hint texts), so one add_hint with multiple
+	// hints doesn't spam the planner's trigger lines one by one.
+	return t.ts.AddNode(db.KindHint, payload, 0, "active", t.worker, anchors)
 }
 
 type goalItem struct {
@@ -1772,7 +1822,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 }
 
 func (t *ToolSet) addHint() actool.CoreTool {
-	return t.writeExpTool("add_hint", "把人类/主 agent 的战略提示挂到探索图，规划者下次生成意图时会读到它。\n"+
+	return t.writeExpTool("add_hint", "把人类/主 agent 的战略提示挂到探索图，规划者下次生成意图时会读到它。提示会以发起调用的 agent 作为来源（主 agent 对话=human，跨任务编排=orchestrator，其他=agent 名）。\n"+
 		"★优先批量：多条提示放进 hints 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 hints 等长同序（失败项 id=0，详情见 errors）。单条则省略 hints 直接给顶层 text。",
 		obj(map[string]any{
 			"hints":        map[string]any{"type": "array", "description": "【优先用这个】要新增的提示数组，按顺序处理。每个元素字段同下方顶层字段（text/asset_ids/traffic_refs）。返回 ids 与本数组等长、同序。", "items": obj(map[string]any{"text": str("提示内容"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": HintTrafficSchema()})},
@@ -1805,12 +1855,14 @@ func (t *ToolSet) addHint() actool.CoreTool {
 				addedTexts = append(addedTexts, strings.TrimSpace(it.Text))
 			}
 			if len(addedTexts) > 0 {
-				// 唤醒 planner（整批一次）。优先 notifyHint：一次 add_hint 记一条「人新增了
-				// N 条战略提示：…」触发，让 planner 明确"本轮由新增 hint 触发"并看到提示内容；
-				// 未接该回调时退回纯 notify（bare wake，hint 仍折在图里供其自行读取）。
+				// Wake the planner (once for the whole batch). Prefer notifyHint: one
+				// add_hint records a single "<origin> added N strategic hints: …" trigger,
+				// so the planner knows "this round was fired by a new hint", who wrote it,
+				// and sees its content; when the callback isn't wired, fall back to plain
+				// notify (bare wake; the hint is still folded into the graph for it to read).
 				switch {
 				case t.notifyHint != nil:
-					t.notifyHint(addedTexts)
+					t.notifyHint(t.worker, addedTexts)
 				case t.notify != nil:
 					t.notify()
 				}

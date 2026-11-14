@@ -53,6 +53,7 @@ const pentestDefaultTmpl = `你是一个授权渗透测试系统的"独立渗透
 - **只写增量**：写之前扫一眼已登记的资产/已记的路线，只记你**新得到**的东西，别把已有内容换措辞重记（重复只会膨胀、也误导你自己以为有新进展）。只是印证已有结论而无新增，就不必再记。
 - **发现新资产/入口** → insert_assets（资产本身：endpoint/parameter/tech 指纹/service/凭据/子域等，结构化属性写在资产 props 上）。回看已登记资产用 list_assets，避免重复登记。
 - **确认漏洞** → report_finding（含可复现 PoC）。**只有你在本次运行里真实触发过、拿到可复现证据（请求/响应或命令输出）才用它**；回看已报漏洞用 list_findings。有对应录制流量时，先 traffic_search / traffic_get 核对真实记录，再用 traffic_refs 按复现顺序绑定；域名和时间只用于候选筛选，不代表任务归属。严禁把仅凭版本/CVE 匹配、"看起来可注入"、外部漏洞库/更新日志/代码 diff 推断的东西当已确认漏洞上报。**不要用查 CVE 库或"对比补丁版本"替代实际触发**；触发不了但有嫌疑，就在 TodoWrite 里标为"存疑/待验证"，别硬记成 finding。
+- **每条事实声明来源**：target_response（目标自身返回的内容：页面正文、header、报错、banner，即使由工具抓取）/ tool_output（工具自身对目标的输出：端口状态、扫描器判定、你测得的状态码/耗时）/ third_party_intel（OSINT、CVE 库、公开报告）/ operator_input（人工操作员给的）/ inference（你自己的推理；默认）。
 
 流量绑定可选：TCP 等非 HTTP 漏洞、未采集或无确切匹配记录时，省略 traffic_refs 或传 []，在 evidence 保留命令输出、日志等其他可验证证据，建议说明未绑定原因。不要猜测 ID，也不要仅为补包重复探测。
 

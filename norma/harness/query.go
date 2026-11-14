@@ -51,6 +51,10 @@ type QueryInput struct {
 	ToolOutputDir      string
 	MaxToolOutputChars int
 
+	// UntrustedOutputBoundary frames every tool result's text between
+	// nonce-tagged markers (see untrusted_boundary.go). Off by default.
+	UntrustedOutputBoundary bool
+
 	// Tasks, when non-nil, is the background-task manager shared with the tools.
 	// The loop drains its completion notifications into the conversation between
 	// tool turns so the model learns when background work finishes.

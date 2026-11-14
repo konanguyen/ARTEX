@@ -16,6 +16,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 )
 
 const (
@@ -78,6 +79,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		AgentKey     string `json:"agent_key"`
 		Title        string `json:"title"`
 		LLMProfileID *int64 `json:"llm_profile_id"`
+		TargetGate   bool   `json:"target_gate"` // approval gate for asset targets, opt-in
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -114,7 +116,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("Title cannot exceed %d characters", maxConversationTitleRunes))
 		return
 	}
-	c, err := pg.CreateConversation(req.AgentKey, title, req.LLMProfileID)
+	c, err := pg.CreateConversationGated(req.AgentKey, title, req.LLMProfileID, req.TargetGate)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -175,14 +177,15 @@ func (s *Server) pgRenameConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Title  *string `json:"title"`
-		Pinned *bool   `json:"pinned"`
+		Title      *string `json:"title"`
+		Pinned     *bool   `json:"pinned"`
+		TargetGate *bool   `json:"target_gate"`
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	if req.Title == nil && req.Pinned == nil {
-		writeErr(w, 400, "At least title or pinned must be provided")
+	if req.Title == nil && req.Pinned == nil && req.TargetGate == nil {
+		writeErr(w, 400, "At least title, pinned or target_gate must be provided")
 		return
 	}
 	if req.Title != nil {
@@ -197,7 +200,7 @@ func (s *Server) pgRenameConversation(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Title = &title
 	}
-	updated, err := pg.UpdateConversation(c.ID, db.ConversationPatch{Title: req.Title, Pinned: req.Pinned})
+	updated, err := pg.UpdateConversation(c.ID, db.ConversationPatch{Title: req.Title, Pinned: req.Pinned, TargetGate: req.TargetGate})
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -496,9 +499,15 @@ func (s *Server) executeExternalConversation(ctx context.Context, c *db.Conversa
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
 		}
 	}
+	// Approval scope of this turn's tool calls for the target gate (chat and retester).
+	// The conversation's opt-in flag is the one read when the turn started: a
+	// switch through the API applies from the next turn.
+	gate := c.TargetGate
+	gctx := intercept.WithTargetScope(ctx, intercept.TargetScope{ConversationID: c.ID, Enabled: func() bool { return gate },
+		WaitBound: intercept.DefaultTargetWaitBound, Interceptor: s.m.interceptor})
 	// On a manual stop ctx is cancelled; Chat already emits a clean "Stopped manually"
 	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+	if _, err := ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
 		runErr = err
 		finishReason = err.Error()
 		if errors.Is(err, agent.ErrChatPersistence) {
@@ -556,9 +565,14 @@ func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64
 		return
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
+	// A conversation triggered by a gated task is gated (the flag only, never pins).
+	gated := false
+	if t, ok := s.m.Task(strconv.FormatInt(taskID, 10)); ok && taskID > 0 {
+		gated = t.targetGate.Load()
+	}
 	s.queueMu.Lock()
 	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable, targetGate: gated})
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
 }
@@ -690,8 +704,19 @@ func mergeTriggeredRuns(items []triggeredRun) triggeredRun {
 		message:   b.String(),
 		taskID:    first.taskID,
 		mergeable: true,
+		targetGate: anyTriggerGated(items),
 		// taskDesc/taskGoal left empty: header already embedded above.
 	}
+}
+
+// anyTriggerGated reports whether any fire of a merged run came from a gated task.
+func anyTriggerGated(items []triggeredRun) bool {
+	for _, it := range items {
+		if it.targetGate {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeAllRuns folds the ENTIRE queued burst into one run (merge_mode='all'),
@@ -732,6 +757,7 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 		message:   b.String(),
 		taskID:    first.taskID,
 		mergeable: true,
+		targetGate: anyTriggerGated(items),
 		// taskDesc/taskGoal left empty: per-task headers already embedded above.
 	}
 }
@@ -746,7 +772,7 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 		}
 	}()
 	pg := s.m.pg
-	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+	c, err := pg.CreateConversationGated(item.agentKey, firstLine(item.title, 60), nil, item.targetGate)
 	if err != nil {
 		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
 		return

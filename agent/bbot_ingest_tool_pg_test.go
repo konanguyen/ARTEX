@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,17 +9,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	actool "github.com/Autumn-27/norma/tool"
 )
-
-func callGuardTool(t *testing.T, tool actool.CoreTool, input string) actool.Result {
-	t.Helper()
-	res, err := tool.Call(context.Background(), json.RawMessage(input), nil)
-	if err != nil {
-		t.Fatalf("%s: transport error: %v", tool.Name(), err)
-	}
-	return res
-}
 
 // A benign bbot output: one in-scope host, one out-of-scope host, one event
 // without scope_distance, an out-of-scope event whose free text names another

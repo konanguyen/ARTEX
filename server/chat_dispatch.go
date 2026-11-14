@@ -242,6 +242,12 @@ func (s *Server) executeChatRun(ctx context.Context, run chatstate.Run) (runErr 
 				writeErr = err
 			}
 		}
+		// Approval scope of this turn's tool calls for the target gate (chat and retester).
+		// The conversation's opt-in flag is the one read when the turn started: a
+		// switch through the API applies from the next turn.
+		gate := c.TargetGate
+		ctx = intercept.WithTargetScope(ctx, intercept.TargetScope{ConversationID: c.ID, Enabled: func() bool { return gate },
+			WaitBound: intercept.DefaultTargetWaitBound, Interceptor: s.m.interceptor})
 		_, err = ca.Chat(ctx, c.AgentKey, run.Session.Key(), message, s.agentMaxTurns(c.AgentKey), time.Duration(s.agentRunSeconds(c.AgentKey))*time.Second, webSearch, emit)
 		_ = s.m.pg.TouchConversation(c.ID)
 		if err != nil {
@@ -269,9 +275,15 @@ func (s *Server) executeChatRun(ctx context.Context, run chatstate.Run) (runErr 
 	if ma == nil {
 		return errors.New("main agent unavailable")
 	}
+	// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.
+	ctx = intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) {
+		a.Worker = "mainagent"
+		emit(a)
+	})
+	ctx = intercept.WithTargetScope(ctx, t.targetScope(intercept.DefaultTargetWaitBound))
 	s.engine.BeginLLMCall(t.ID)
 	defer s.engine.EndLLMCall(t.ID)
-	_, err = ma.Chat(ctx, run.Session.TaskID, seg, s.m.Assets(), t.Store, t.Goal, message, emit, t.Notify, func() { s.reviveTask(t) }, t.NotifyGoal, t.NotifyHint)
+	_, err = ma.Chat(ctx, run.Session.TaskID, seg, s.m.Assets(), t.Store, t.Goal, message, t.TargetGuard.Hooks(), emit, t.Notify, func() { s.reviveTask(t) }, t.NotifyGoal, t.NotifyHint)
 	return err
 }
 

@@ -7,14 +7,27 @@ import (
 	"slices"
 
 	"github.com/Autumn-27/artex/egress"
+	"github.com/Autumn-27/artex/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// withWebFetch returns tools plus the WebFetch tool of an agent session. Each
-// call goes through the shared egress governor (see governedFetch). tools is
-// not modified.
+// withWebFetch returns tools plus the WebFetch tool of an agent session. Every
+// agent kind builds WebFetch here, one tool per run, so that its configuration
+// can depend on the run: every redirect hop goes through the target gate
+// (intercept.RedirectCheck), and every connection through the pinned dialer
+// (intercept.PinnedDialer), on the client that uses proxy and on the direct
+// retry client alike. ctx is the context of the run: when it carries a target
+// scope the dialer never connects without one, and when that scope's gate is
+// on the direct retry is turned off for the run, since it would leave without
+// the proxy. Each call also goes through the shared egress governor (see
+// governedFetch). The tool is added after the session's own tools, where
+// agentcore adds it, so the tool list keeps its order. caCert is the recording
+// proxy's CA, trusted to verify the HTTPS it re-signs. tools is not modified.
 func withWebFetch(ctx context.Context, tools []actool.CoreTool, proxy, caCert string) []actool.CoreTool {
-	webFetch := actool.NewWebFetch(actool.WebFetchConfig{Proxy: proxy, CACert: caCert})
+	scope, scoped := intercept.TargetScopeFromContext(ctx)
+	gated := scoped && scope.Enabled != nil && scope.Enabled()
+	webFetch := actool.NewWebFetch(actool.WebFetchConfig{Proxy: proxy, CACert: caCert, CheckRedirect: intercept.RedirectCheck("WebFetch"),
+		DialContext: intercept.PinnedDialer("WebFetch", scoped), DisableDirectRetry: gated})
 	return append(tools[:len(tools):len(tools)], governedFetch{webFetch, egress.Shared()})
 }
 
@@ -23,8 +36,9 @@ func withWebFetch(ctx context.Context, tools []actool.CoreTool, proxy, caCert st
 // the rate, jitter and concurrency of the URL's host, and, within one task,
 // identical calls (WebFetch only sends GET) coalesced and cached. A failed call
 // is not cached. WebFetch ignores tc, so a shared result fits every caller.
-// Norma owns the HTTP client, so redirect hops are not paced separately and a
-// 429/503 is not retried.
+// Redirect hops are gate-checked by the client policy and every connection is
+// dialed by the pinned dialer; hops are not paced separately and a 429/503 is
+// not retried.
 type governedFetch struct {
 	actool.CoreTool
 	g *egress.Governor

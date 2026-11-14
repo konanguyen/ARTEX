@@ -151,6 +151,9 @@ type triggeredRun struct {
 	taskDesc  string // 任务描述(任务级,同任务相同);合并时只渲染一次
 	taskGoal  string // 任务目标(任务级,同任务相同);合并时只渲染一次
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
+	// targetGate: the source task had the target gate on when the event fired; a
+	// merged run is gated if any of its fires is. Never carries pins.
+	targetGate bool
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
@@ -761,6 +764,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptUpdateRule)
 	mux.HandleFunc("DELETE /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptDeleteRule)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules/{rid}/toggle", s.taskInterceptToggleRule)
+	mux.HandleFunc("GET /api/tasks/{id}/target-pins", s.taskListTargetPins)
+	mux.HandleFunc("POST /api/tasks/{id}/target-pins/{pid}/revoke", s.taskRevokeTargetPin)
 	mux.HandleFunc("GET /api/tasks/{id}/credentials", s.listTaskCredentials)
 	mux.HandleFunc("POST /api/tasks/{id}/credentials", s.addTaskCredential)
 	mux.HandleFunc("DELETE /api/tasks/{id}/credentials/{cid}", s.deleteTaskCredential)
@@ -912,6 +917,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.pgSendConversationMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/stop", s.pgStopConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/messages/{seq}", s.pgConversationMsgDetail)
+	mux.HandleFunc("GET /api/conversations/{id}/target-pins", s.convListTargetPins)
+	mux.HandleFunc("POST /api/conversations/{id}/target-pins/{pid}/revoke", s.convRevokeTargetPin)
 
 	mux.HandleFunc("GET /api/agents", s.pgListAgents)
 	mux.HandleFunc("POST /api/agents", s.pgCreateAgent)
@@ -1010,6 +1017,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/task/{taskID}", s.interceptListTaskItems)
 	mux.HandleFunc("GET /api/intercept/tool-config", s.interceptGetToolConfig)
 	mux.HandleFunc("PUT /api/intercept/tool-config", s.interceptSetToolConfig)
+	mux.HandleFunc("GET /api/target-gate/exemptions", s.targetGateGetExemptions)
+	mux.HandleFunc("PUT /api/target-gate/exemptions", s.targetGateSetExemptions)
+	mux.HandleFunc("GET /api/target-gate/exemptions/history", s.targetGateExemptionHistory)
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
@@ -1609,6 +1619,7 @@ type createTaskReq struct {
 	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
 	LLMRotate            *bool    `json:"llm_rotate,omitempty"`        // per-intent round-robin over task LLM chain heads (#85)
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	TargetGate           *bool    `json:"target_gate,omitempty"`       // approval gate for asset targets, opt-in; omitted/null = off
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
@@ -1681,6 +1692,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,
 		LLMRotate:       req.LLMRotate,
+		TargetGate:      req.TargetGate,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
