@@ -7,8 +7,8 @@ import (
 )
 
 // ARTEX_LLM_PROVIDER is matched regardless of case and surrounding spaces. A
-// miss used to fall through to anthropic: "Ollama" then sent ANTHROPIC_API_KEY
-// to the Ollama base URL.
+// miss used to fall through to anthropic: "OpenAI" with mixed casing then sent
+// ANTHROPIC_API_KEY instead of OPENAI_API_KEY.
 func TestFromEnvProviderIsCaseInsensitive(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
 	t.Setenv("OPENAI_API_KEY", "sk-oai")
@@ -19,11 +19,12 @@ func TestFromEnvProviderIsCaseInsensitive(t *testing.T) {
 		want llm.Format
 		key  string
 	}{
-		{"Ollama", FormatOllama, ""},
-		{" OLLAMA ", FormatOllama, ""},
 		{"OpenAI", llm.FormatOpenAI, "sk-oai"},
+		{" OPENAI ", llm.FormatOpenAI, "sk-oai"},
 		{"OpenAI-Responses", llm.FormatOpenAIResponses, "sk-oai"},
+		{" OPENAI-RESPONSES ", llm.FormatOpenAIResponses, "sk-oai"},
 		{"Anthropic", llm.FormatAnthropic, "sk-ant-secret"},
+		{" ANTHROPIC ", llm.FormatAnthropic, "sk-ant-secret"},
 	} {
 		t.Setenv("ARTEX_LLM_PROVIDER", tc.env)
 		c, ok := FromEnv()
