@@ -258,6 +258,18 @@ func factIDsYielded(ts *db.ExplorationStore, id int64) string {
 	return strings.Join(parts, "、")
 }
 
+// plannerToolQuery is the Tool RAG query for one planning round: the goal plus the
+// short texts the round's triggers already carry (no store lookups).
+func plannerToolQuery(goal string, triggers []TriggerEvent) string {
+	parts := []string{goal}
+	for _, ev := range triggers {
+		parts = append(parts, ev.Summary, ev.NewGoal)
+		parts = append(parts, ev.Goals...)
+		parts = append(parts, ev.Hints...)
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
 // intentSummary reads an intent node's one-line summary (best-effort, "?" on miss).
 func intentSummary(ts *db.ExplorationStore, id int64) string {
 	n, err := ts.GetNode(id)
@@ -370,7 +382,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir)
+	return body + artifactSpec(workDir) + noiseProfileBlock()
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
@@ -403,7 +415,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
-	tools, def, cleanup := AugmentTools(ctx, "planner", base)
+	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, plannerToolQuery(goal, triggers)), "planner", base)
 	defer cleanup()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能

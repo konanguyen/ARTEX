@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 
 	"github.com/miekg/dns"
 	"github.com/projectdiscovery/dnsx/libs/dnsx"
@@ -90,7 +91,8 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 // buildClient returns an HTTP client that dials via the recording proxy (resolved
 // per-request via proxy(), so the traffic-capture toggle applies live) and skips
 // TLS verification (the proxy re-signs with its MITM CA; targets are often
-// self-signed — this is a pentest probe).
+// self-signed — this is a pentest probe). Every request goes through the shared
+// egress governor (the noise profile; off by default).
 func buildClient(proxy func() string) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
@@ -107,7 +109,7 @@ func buildClient(proxy func() string) *http.Client {
 		}
 	}
 	return &http.Client{
-		Transport: tr,
+		Transport: egress.Shared().Transport(tr),
 		Timeout:   httpTimeout,
 		// cap redirects; keep them within scope by re-checking at probe time
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -230,7 +232,6 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "artex-enrich/1.0")
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return

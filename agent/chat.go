@@ -94,7 +94,7 @@ func chatSystem(agentKey, dataDir, workDir string) string {
 	case "retester":
 		def = RetesterDefaultPrompt
 	}
-	return renderSystem(agentKey, def, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	return renderSystem(agentKey, def, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir) + noiseProfileBlock()
 }
 
 func (c *ChatAgent) nativeOllama() bool {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -550,9 +551,13 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
+	// The shared egress governor paces every request and redirect hop per host
+	// under the noise profile (off by default: the base transport itself).
+	var base http.RoundTripper = http.DefaultTransport
 	if tr := s.httpProxyTransport(spec); tr != nil {
-		client.Transport = tr
+		base = tr
 	}
+	client.Transport = egress.Shared().Transport(base)
 	resp, err := client.Do(req)
 	if err != nil {
 		return actool.Errorf("Request failed: " + err.Error()), nil

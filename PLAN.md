@@ -159,7 +159,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - Ngân sách phân cấp `task -> intent -> planner round` (`agent/budget.go`, tắt mặc định) tự động dừng mở rộng và chuyển sang vòng `wrap-up` khi cạn ngân sách.
   - **File chính**: `db/coverage_ledger.go`, `agent/coverage_ledger.go`, `agent/budget.go`, `server/engine_budget.go`.
 
-- [ ] **5.3. Bộ điều tiết lưu lượng `Egress Governor`, `Noise Profiles` & `Lexical Tool RAG` (`BaaRai #204, #205, #212`)** ⚠️ **`[Chạm Prompt Tail ở #212]`**
+- [x] **5.3. Bộ điều tiết lưu lượng `Egress Governor`, `Noise Profiles` & `Lexical Tool RAG` (`BaaRai #204, #205, #212`)** ⚠️ **`[Chạm Prompt Tail ở #212]`**
   - **Mô tả**:
     - Package `egress/` điều tiết tốc độ gửi request theo từng host (token bucket, concurrency cap, jitter, backoff `429`/`503`, gom các request `WebFetch GET` trùng lặp) theo cấu hình `ARTEX_NOISE_PROFILE`.
     - `ARTEX_TOOL_RAG` (`agent/toolrag.go`): lọc từ vựng danh sách công cụ gắn cho agent, chỉ giữ lại các công cụ cốt lõi và top-K công cụ phù hợp nhất với nhiệm vụ để tiết kiệm token.
