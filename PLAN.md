@@ -147,7 +147,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
 
 ## Giai đoạn 5: Công cụ Recon, Nạp Kết quả Quét, Ngân sách & Kiểm soát Agentic Nâng cao
 
-- [ ] **5.1. Công cụ nạp kết quả quét có cấu trúc: `ingest_scan_output` & `ingest_bbot` (`BaaRai #199, #200, #214, #215, #222`)**
+- [x] **5.1. Công cụ nạp kết quả quét có cấu trúc: `ingest_scan_output` & `ingest_bbot` (`BaaRai #199, #200, #214, #215, #222`)**
   - **Mô tả**: Thêm 2 công cụ cho worker:
     - `ingest_scan_output`: đọc trực tiếp file kết quả của `nmap` (XML), `nuclei`, `httpx`, `ffuf` (JSONL) và nạp thành assets/facts vào đồ thị mà không làm tràn context LLM.
     - `ingest_bbot`: đọc file JSONL của `bbot`, tự động tách sự kiện trong scope (`scope_distance == 0`) để chèn asset và sự kiện ngoài scope thành fact tình báo; tự lọc bỏ thông tin nhạy cảm `userinfo` trong URL (`#222`).

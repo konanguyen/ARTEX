@@ -655,6 +655,11 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
+		// bbot output by path: in-scope assets via insert_assets, the rest as
+		// third_party_intel facts (never auto-scoped).
+		t.ingestBbot(),
+		// scanner output (nmap -oX, nuclei -jsonl, httpx -json, ffuf -of json) by path, without the raw output.
+		t.ingestScanOutput(),
 		// Task credentials (#3): reuse user-declared test accounts, record
 		// self-registered ones so they are not forgotten.
 		t.saveTaskCredential(), t.listTaskCredentials(),
