@@ -632,9 +632,18 @@ export default function SkillsPage() {
         return (
           <div key={node.path}>
             <div
+              role="treeitem"
+              tabIndex={0}
+              aria-expanded={open}
               className="group relative flex cursor-pointer select-none items-center gap-1 rounded py-0.5 pr-1 text-sm hover:bg-muted"
               style={{ paddingLeft: baseIndent }}
               onClick={() => toggleExpanded(key)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleExpanded(key);
+                }
+              }}
             >
               <ChevronRightIcon className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} />
               {open
@@ -674,12 +683,21 @@ export default function SkillsPage() {
       return (
         <div
           key={node.path}
+          role="treeitem"
+          tabIndex={0}
+          aria-selected={isSelected}
           className={cn(
             "group relative flex cursor-pointer select-none items-center gap-1 rounded py-0.5 pr-1 text-sm",
             isSelected ? "bg-accent text-accent-foreground" : "hover:bg-muted",
           )}
           style={{ paddingLeft: baseIndent + 16 }}
           onClick={() => setSelected({ skill, path: node.path })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setSelected({ skill, path: node.path });
+            }
+          }}
         >
           <FileTextIcon className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1 truncate font-mono text-xs" title={node.path}>{node.name}</span>
@@ -774,6 +792,10 @@ export default function SkillsPage() {
                   <div key={s.name}>
                     {/* skill 根节点 */}
                     <div
+                      role="treeitem"
+                      tabIndex={0}
+                      aria-expanded={isOpen}
+                      aria-selected={isSkillSelected}
                       className={cn(
                         "group relative flex cursor-pointer select-none items-center gap-1 rounded px-2 py-1 text-sm",
                         isSkillSelected ? "bg-accent text-accent-foreground" : "hover:bg-muted",
@@ -781,6 +803,13 @@ export default function SkillsPage() {
                       onClick={() => {
                         toggleExpanded(s.name);
                         setSelected({ skill: s.name, path: null });
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          toggleExpanded(s.name);
+                          setSelected({ skill: s.name, path: null });
+                        }
                       }}
                     >
                       <ChevronRightIcon className={cn("size-3.5 shrink-0 transition-transform", isOpen && "rotate-90")} />
