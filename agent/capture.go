@@ -39,6 +39,7 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 	defer auditTrace.Finish()
 	var reason harness.TerminalReason
 	rec := func(r db.Activity) {
+		r = stampChatActivity(ctx, r)
 		if r.Kind == "text" || r.Kind == "tool_result" {
 			auditTrace.Append(db.InterceptContextEntry{Kind: r.Kind, Tool: r.Tool, ToolUseID: r.ToolUseID, Text: r.Detail, IsError: r.IsError})
 		}
@@ -131,6 +132,9 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				if ev.Terminal.Reason != harness.ReasonAbortedStreaming {
 					sidequestion.Finish(ctx, ev.Terminal.Messages)
 				}
+				if err := finishChatTranscript(ctx, ev.Terminal.Messages); err != nil {
+					rerr = err
+				}
 				finalText = ev.Terminal.Text
 				reason = ev.Terminal.Reason
 				// the buffered tail text usually equals Terminal.Text (final answer);
@@ -144,12 +148,12 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				if sum == "" || ev.Terminal.Reason == harness.ReasonAbortedTools || ev.Terminal.Reason == harness.ReasonAbortedStreaming {
 					sum, detail = terminalText(ctx, ev.Terminal, lastTool)
 				}
-				u := ev.Terminal.Usage // cumulative token usage for this session
-				rec(db.Activity{Kind: "result", IsError: ev.Terminal.Err != nil,
+				u := ev.Terminal.Usage // cumulative token usage within this Prompt query
+				rec(db.Activity{Kind: "result", IsError: ev.Terminal.Err != nil || rerr != nil,
 					Summary: firstLine(sum, 400), Detail: detail,
 					InputTokens: &u.InputTokens, OutputTokens: &u.OutputTokens,
 					CacheReadTokens: &u.CacheReadTokens, CacheWriteTokens: &u.CacheWriteTokens})
-				if ev.Terminal.Err != nil {
+				if ev.Terminal.Err != nil && rerr == nil {
 					rerr = ev.Terminal.Err
 				}
 			}

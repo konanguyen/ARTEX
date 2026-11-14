@@ -76,15 +76,32 @@ func (c *ChatAgent) SetGuard(g *guard.Guard) { c.guard = g }
 
 // chatWorkDirSpec returns a working-directory notice appended to every chat
 // agent's system prompt. Mirrors artifactSpec but without pentest-specific
-// wording ("payload", "抓响应体") that would be odd in a general assistant.
+// wording such as payload or captured response bodies would be odd in a general assistant.
 func chatWorkDirSpec(workDir string) string {
-	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。"
+	return "\n\n**File output rules**: Write all files to the working directory " + workDir + " (the default CWD; use relative paths or this absolute path). Do not write to /tmp or other absolute paths."
 }
 
-// chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
-// no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
+// chatSystem preserves the role default if its stored template is missing or invalid.
 func chatSystem(agentKey, dataDir, workDir string) string {
-	return renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	def := DefaultAssistantPrompt
+	switch agentKey {
+	case "auto":
+		def = autoDefaultTmpl
+	case "pentest":
+		def = pentestDefaultTmpl
+	case "reporter":
+		def = ReporterDefaultPrompt
+	case "retester":
+		def = RetesterDefaultPrompt
+	}
+	return renderSystem(agentKey, def, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+}
+
+func (c *ChatAgent) nativeOllama() bool {
+	nativeOllamaResolversMu.RLock()
+	fn := nativeOllamaResolvers[c]
+	nativeOllamaResolversMu.RUnlock()
+	return fn != nil && fn()
 }
 
 // chatVars carries the runtime variables a custom agent's prompt may reference.
@@ -167,15 +184,23 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		opts.Transcript = c.tx
 		opts.SessionID = sessionID
 	}
-	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
-	enableNoa(&opts, c.noaEnabledFn, c.workDir, "chat-"+sessionID, noaWarn("chat-"+sessionID))
+	// Experimental noa compaction stores persistent archives under <workDir>/noa/<SessionID>.
+	secureWebSearch(&opts, nil)
+	if err := bindChatRunOptions(ctx, &opts); err != nil {
+		return "", err
+	}
+	applyRuntimePolicy(&opts, RuntimePolicy{NativeOllama: c.nativeOllama(), ContextWindow: c.window})
+	noaSessionState := enableNoa(&opts, c.noaEnabledFn, c.workDir, chatNoaSession(ctx, "chat-"+sessionID), noaWarn("chat-"+sessionID))
+	ctx = attachChatContext(ctx, &opts, def, noaSessionState)
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
 	// reload prior conversation so the agent has context across turns (each Chat is
 	// a fresh session). First turn: no file yet → Resume loads nothing and proceeds.
 	if c.tx != nil {
-		_ = s.Resume(sessionID)
+		if err := s.Resume(opts.SessionID); err != nil {
+			return "", err
+		}
 	}
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.

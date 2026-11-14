@@ -124,7 +124,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
 
 ## Giai đoạn 4: Trải nghiệm Chat Nâng cao, Dán Tài liệu & Đa dạng LLM Provider
 
-- [ ] **4.1. Điều khiển Chat nâng cao, Dán tài liệu & Lưu Finding độc lập (`cskwork #29, #30, #32, #80` — `v0.6.0`)**
+- [x] **4.1. Điều khiển Chat nâng cao, Dán tài liệu & Lưu Finding độc lập (`cskwork #29, #30, #32, #80` — `v0.6.0`)**
   - **Mô tả**:
     - Hàng đợi tin nhắn (`/queue`: thêm, sửa, đổi thứ tự, tạm dừng/tiếp tục, hủy), điều hướng khi tool đang chạy (`/steer`), thử lại (`/retry`), sửa câu hỏi cũ & rẽ nhánh hội thoại (`/branch`).
     - Xem và nén context thủ công (`/context`, `/usage`, `/compress`) giữ lại các lượt trao đổi gần nhất; lọc ký tự `\u0000` NUL khi lưu snapshot (`#80`).

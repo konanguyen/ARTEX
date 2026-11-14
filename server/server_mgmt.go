@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/llm"
@@ -109,6 +110,12 @@ func (s *Server) beginTaskDelete(taskID string) bool {
 // paused on an unreadable row is conservative: a later explicit resume can
 // safely recover it without allowing work to escape an uncertain delete.
 func (s *Server) abortTaskDelete(taskID string) {
+	if s.m != nil && s.m.pg != nil {
+		if t := s.m.ResolveTask(taskID); t != nil {
+			n, _ := strconv.ParseInt(taskID, 10, 64)
+			_ = s.m.pg.ReopenChatGate(context.Background(), chatstate.SessionRef{TaskID: n, ExplorationID: t.ExpID})
+		}
+	}
 	s.concMu.Lock()
 	defer s.concMu.Unlock()
 	keepPaused := true
@@ -154,6 +161,10 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 
 	// Main-agent runs use a separate context from planner/workers. Cancel it, then
 	// wait until both execution domains have returned before removing transcripts.
+	if err := s.closeTaskChatGate(r.Context(), id); err != nil {
+		chatControlError(w, err)
+		return
+	}
 	s.cancelTaskChat(id, agent.AbortTaskDeleted)
 	drainCtx, cancelDrain := context.WithTimeout(r.Context(), taskDeleteDrainTimeout)
 	defer cancelDrain()

@@ -990,6 +990,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS exploration_id BIGINT UNIQUE REFERENCES explorations(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_llm_profile ON conversations(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at DESC) WHERE pinned_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_conversations_upd ON conversations;
@@ -1460,3 +1461,149 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_input_per_m NUMERIC(12,6
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_output_per_m NUMERIC(12,6);
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_read_per_m NUMERIC(12,6);
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_write_per_m NUMERIC(12,6);
+
+-- Durable chat admission. A task gate is shared by every MainAgent segment.
+CREATE TABLE IF NOT EXISTS chat_control_gates (
+ gate_key TEXT PRIMARY KEY,
+ conversation_id BIGINT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+ task_id BIGINT UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+ paused BOOLEAN NOT NULL DEFAULT false,
+ active_run_id TEXT,
+ revision BIGINT NOT NULL DEFAULT 0,
+ CHECK ((conversation_id IS NOT NULL)::int + (task_id IS NOT NULL)::int = 1)
+);
+CREATE TABLE IF NOT EXISTS chat_control_sessions (
+ session_key TEXT PRIMARY KEY,
+ gate_key TEXT NOT NULL REFERENCES chat_control_gates(gate_key) ON DELETE CASCADE,
+ conversation_id BIGINT REFERENCES conversations(id) ON DELETE CASCADE,
+ task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
+ exploration_id BIGINT REFERENCES explorations(id) ON DELETE CASCADE,
+ main_seg INT NOT NULL DEFAULT 0,
+ history_revision BIGINT NOT NULL DEFAULT 0,
+ transcript_id TEXT NOT NULL DEFAULT '',
+ parent_session_key TEXT REFERENCES chat_control_sessions(session_key) ON DELETE SET NULL,
+ parent_turn_id TEXT,
+ preparing BOOLEAN NOT NULL DEFAULT false,
+ CHECK ((conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND main_seg=0) OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL AND main_seg>=0))
+);
+CREATE TABLE IF NOT EXISTS chat_control_inputs (
+ id TEXT PRIMARY KEY,
+ session_key TEXT NOT NULL REFERENCES chat_control_sessions(session_key) ON DELETE CASCADE,
+ gate_key TEXT NOT NULL REFERENCES chat_control_gates(gate_key) ON DELETE CASCADE,
+ client_id TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK (kind IN ('turn','steer')),
+ target_run_id TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL CHECK (status IN ('queued','claimed','delivered','completed','failed','cancelled','undelivered','unknown')),
+ prompt JSONB NOT NULL,
+ revision BIGINT NOT NULL DEFAULT 0,
+ ordinal BIGINT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ UNIQUE(session_key,client_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_input_pending ON chat_control_inputs(gate_key,ordinal) WHERE status='queued';
+CREATE TABLE IF NOT EXISTS chat_control_runs (
+ id TEXT PRIMARY KEY,
+ input_id TEXT NOT NULL UNIQUE REFERENCES chat_control_inputs(id) ON DELETE CASCADE,
+ session_key TEXT NOT NULL REFERENCES chat_control_sessions(session_key) ON DELETE CASCADE,
+ turn_id TEXT NOT NULL,
+ supersedes_run_id TEXT REFERENCES chat_control_runs(id) ON DELETE SET NULL,
+ history_revision BIGINT NOT NULL,
+ transcript_id TEXT NOT NULL DEFAULT '',
+ start_record_uuid TEXT NOT NULL DEFAULT '',
+ end_record_uuid TEXT NOT NULL DEFAULT '',
+ prompt JSONB NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('running','completed','failed','stopped','unknown')),
+ model TEXT NOT NULL DEFAULT '',
+ usage JSONB NOT NULL DEFAULT '{}',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ completed_at TIMESTAMPTZ
+);
+ALTER TABLE activity ADD COLUMN IF NOT EXISTS turn_id TEXT;
+ALTER TABLE activity ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE activity ADD COLUMN IF NOT EXISTS active_attempt BOOLEAN;
+ALTER TABLE activity ADD COLUMN IF NOT EXISTS history_mutable BOOLEAN;
+ALTER TABLE conversation_activities ADD COLUMN IF NOT EXISTS turn_id TEXT;
+ALTER TABLE conversation_activities ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE conversation_activities ADD COLUMN IF NOT EXISTS active_attempt BOOLEAN;
+ALTER TABLE conversation_activities ADD COLUMN IF NOT EXISTS history_mutable BOOLEAN;
+
+CREATE TABLE IF NOT EXISTS chat_transcript_revisions (
+ id TEXT PRIMARY KEY,
+ session_key TEXT NOT NULL REFERENCES chat_control_sessions(session_key) ON DELETE CASCADE,
+ transcript_id TEXT NOT NULL UNIQUE,
+ history_revision BIGINT NOT NULL,
+ end_record_uuid TEXT NOT NULL,
+ sha256 TEXT NOT NULL,
+ byte_length BIGINT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ UNIQUE(session_key,history_revision)
+);
+ALTER TABLE chat_control_sessions ADD COLUMN IF NOT EXISTS active_revision_id TEXT REFERENCES chat_transcript_revisions(id) ON DELETE SET NULL;
+
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS preparing BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE main_sessions ADD COLUMN IF NOT EXISTS preparing BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE chat_control_sessions ADD COLUMN IF NOT EXISTS parent_ref JSONB;
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS imported BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS source_run_id TEXT;
+ALTER TABLE chat_control_inputs ADD COLUMN IF NOT EXISTS turn_id TEXT;
+ALTER TABLE chat_control_inputs ADD COLUMN IF NOT EXISTS supersedes_run_id TEXT REFERENCES chat_control_runs(id) ON DELETE SET NULL;
+CREATE TABLE IF NOT EXISTS chat_history_changes (
+ session_key TEXT NOT NULL REFERENCES chat_control_sessions(session_key) ON DELETE CASCADE,
+ client_id TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ kind TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('preparing','published','failed')),
+ target_session_key TEXT REFERENCES chat_control_sessions(session_key) ON DELETE SET NULL,
+ result JSONB,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(session_key,client_id)
+);
+ALTER TABLE chat_history_changes ADD COLUMN IF NOT EXISTS input_id TEXT REFERENCES chat_control_inputs(id) ON DELETE SET NULL;
+
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS turn_ordinal BIGINT NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_current_attempt ON chat_control_runs(session_key,turn_id) WHERE active;
+
+-- One current observation belongs to the session; NULL means unobserved.
+ALTER TABLE chat_control_sessions ADD COLUMN IF NOT EXISTS context_snapshot JSONB;
+DO $$
+BEGIN
+    IF to_regclass('chat_context_snapshots') IS NOT NULL THEN
+        LOCK TABLE chat_context_snapshots IN ACCESS EXCLUSIVE MODE;
+        -- Refuse ambiguous partial upgrades rather than discard either payload.
+        IF EXISTS (
+            SELECT 1 FROM chat_context_snapshots c
+            LEFT JOIN chat_control_sessions s USING(session_key)
+            WHERE s.session_key IS NULL OR
+                (s.context_snapshot IS NOT NULL AND s.context_snapshot <> to_jsonb(c)-'session_key')
+        ) THEN
+            RAISE EXCEPTION 'chat context snapshot migration has a missing session or conflicting payload';
+        END IF;
+        UPDATE chat_control_sessions s SET context_snapshot=to_jsonb(c)-'session_key'
+        FROM chat_context_snapshots c
+        WHERE s.session_key=c.session_key AND s.context_snapshot IS NULL;
+        DROP TABLE chat_context_snapshots;
+    END IF;
+END $$;
+ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS main_seg INTEGER;
+ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS history_revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS history_revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS source_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE chat_control_gates ADD COLUMN IF NOT EXISTS operation_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS chat_context_changes (
+ session_key TEXT NOT NULL REFERENCES chat_control_sessions(session_key) ON DELETE CASCADE,
+ client_id TEXT NOT NULL,
+ token TEXT NOT NULL UNIQUE,
+ fingerprint TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('preparing','published','aborted')),
+ result JSONB,
+ PRIMARY KEY(session_key,client_id)
+);
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS baseline_recorded BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS before_record_uuid TEXT NOT NULL DEFAULT '';
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE chat_control_gates ADD COLUMN IF NOT EXISTS closed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE chat_control_inputs ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
+ALTER TABLE chat_control_runs ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
+ALTER TABLE chat_control_inputs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'user';

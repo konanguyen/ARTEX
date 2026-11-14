@@ -114,8 +114,12 @@ type Node struct {
 
 // Activity is one worker execution step (= old task_activity).
 type Activity struct {
-	ID        int64           `json:"id"`
-	NodeID    *int64          `json:"node_id,omitempty"`
+	TurnID         string          `json:"turn_id,omitempty"`
+	RunID          string          `json:"run_id,omitempty"`
+	ActiveAttempt  *bool           `json:"active_attempt,omitempty"`
+	HistoryMutable *bool           `json:"history_mutable,omitempty"`
+	ID             int64           `json:"id"`
+	NodeID         *int64          `json:"node_id,omitempty"`
 	Worker    string          `json:"worker,omitempty"`
 	Kind      string          `json:"kind,omitempty"`
 	Tool      string          `json:"tool,omitempty"`

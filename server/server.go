@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
@@ -82,7 +82,10 @@ type Server struct {
 	// convBusyKey), so a manual stop can abort JUST that session's agent run. Set/
 	// cleared alongside chatBusy under chatMu. Aborting a run does NOT touch the P3
 	// trigger queue — the drain goroutine simply proceeds to the next queued fire.
-	chatCancel map[string]context.CancelCauseFunc
+	chatCancel    map[string]context.CancelCauseFunc
+	chatMutations map[string]map[string]context.CancelCauseFunc
+	chatClosing   bool
+	chatWG        sync.WaitGroup
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
 	// to a concurrency limit derived from the agent's策略: serial → limit 1 (+ optional
@@ -151,12 +154,21 @@ type triggeredRun struct {
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
+	s, err := newServer(ctx, m, skillDir, dataDir, keyDir, opts...)
+	if err != nil {
+		log.Fatalf("[server] startup: %v", err)
+	}
+	return s
+}
+
+func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) (*Server, error) {
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
-		log.Fatalf("[auth] JWT key: %v", err)
+		return nil, fmt.Errorf("JWT key: %w", err)
 	}
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
-		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
+		chatCancel: map[string]context.CancelCauseFunc{}, chatMutations: map[string]map[string]context.CancelCauseFunc{},
+		triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
@@ -167,6 +179,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	}
 	s.initSetupToken()
 	s.initSideQuestions()
+	if err := s.recoverChatControls(); err != nil {
+		return nil, fmt.Errorf("chat startup recovery: %w", err)
+	}
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -233,7 +248,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
-		domainReg := buildDomainReg(m.Assets())
+		domainReg := s.domainToolRegistry()
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
@@ -280,7 +295,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
-	return s
+	if err := s.resumeChatControls(); err != nil {
+		log.Printf("[chat] startup resume: %v", err)
+	}
+	return s, nil
 }
 
 // Restored deadline and worker loops must inherit the same context as new tasks,
@@ -870,6 +888,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
+	mux.HandleFunc("/api/conversations/{id}/controls", s.chatControls)
+	mux.HandleFunc("/api/conversations/{id}/controls/{rest...}", s.chatControls)
+	mux.HandleFunc("GET /api/conversations/{id}/findings", s.pgConversationFindings)
+	mux.HandleFunc("/api/tasks/{id}/chat/controls", s.chatControls)
+	mux.HandleFunc("/api/tasks/{id}/chat/controls/{rest...}", s.chatControls)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
 	mux.HandleFunc("GET /api/tasks/{id}/chat/status", s.taskChatStatus)
@@ -3903,106 +3926,24 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "no active task")
 		return
 	}
-	if s.engine.IsDeleting(t.ID) {
-		writeErr(w, 409, "Task is being deleted, cannot send new message")
-		return
-	}
-	// 注意:任务暂停(paused)不拦截主 Agent 对话。主 Agent 编排会话独立于 planner/
-	// worker 的暂停,暂停中仍可继续对话(暂停只终止其正在进行的那一轮,见 control())。
 	var req struct {
 		Message     string           `json:"message"`
-		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对任务工作目录)
-		Seg         *int             `json:"seg,omitempty"`         // 目标主会话分段;缺省=最新段
+		Attachments []chatAttachment `json:"attachments"`
+		Seg         *int             `json:"seg"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, 400, err.Error())
+	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
-	if !ok {
+	seg, err := t.Store.CurrentMainSeg()
+	if err != nil {
+		writeError(w, 500, err)
 		return
 	}
-	// Admission is serialized with deletion's chat cancellation. Mark every chat
-	// turn busy before its first activity/file write, including rule-mode turns.
-	// If deletion wins the race, the second barrier check rejects this request.
-	s.chatMu.Lock()
-	if s.engine.IsDeleting(t.ID) {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "Task is being deleted, cannot send new message")
-		return
+	if req.Seg != nil {
+		seg = *req.Seg
 	}
-	if s.chatBusy[t.ID] {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "Main Agent is processing the previous message, please wait")
-		return
-	}
-	ctx, cancel := context.WithCancelCause(s.ctx)
-	ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
-	s.chatBusy[t.ID] = true
-	s.chatCancel[t.ID] = cancel
-	s.chatMu.Unlock()
-
-	// The turn belongs to whichever main-agent segment the user is chatting in (any
-	// segment is interactive, like the top-level chat conversations). Stamp every
-	// mainagent row with it so this turn's transcript + activity land in that segment.
-	// Missing seg (older clients) falls back to the newest segment.
-	mainSeg := 0
-	if req.Seg != nil && *req.Seg >= 0 {
-		mainSeg = *req.Seg
-	} else {
-		mainSeg, _ = t.Store.CurrentMainSeg()
-	}
-	segPtr := &mainSeg
-
-	// Persist + broadcast the human turn so the 主 Agent 编排会话 survives page
-	// reloads and updates live: the conversation lives in the activity stream as
-	// worker="mainagent" (the per-task activity table, replayed via SSE). With
-	// attachments, the activity's Detail carries {text, attachments} so the transcript
-	// renders attachment cards.
-	humanTurn := userActivityWithAttachments("mainagent", req.Message, req.Attachments)
-	humanTurn.MainSeg = segPtr
-	s.engine.emitActivity(t, humanTurn)
-	var ma *agent.MainAgent
-	if s.taskRuntimeAvailable(t, "mainagent") {
-		ma = s.agentsForTask(t).main
-	}
-	if ma != nil {
-		// Run the agent on a per-turn cancellable ctx (NOT r.Context()): the turn can
-		// take minutes (multi-tool loop), and binding it to the request lifecycle meant
-		// a page reload / proxy timeout cancelled it mid-run ("context canceled"). The
-		// steps + final answer stream back live via SSE (worker="mainagent"), so the
-		// handler returns immediately and the browser never needs to hold the request.
-		go func() {
-			defer func() {
-				s.finishTaskChat(t.ID, cancel)
-			}()
-			// emit every step (thinking/tool_use/tool_result/text/result) so the main
-			// agent session shows its work live, like worker/planner. The final answer
-			// is the captured "result" step — no separate reply emit (would duplicate).
-			emit := func(rec db.Activity) {
-				rec.MainSeg = segPtr
-				s.engine.emitActivity(t, rec)
-			}
-			maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
-			resume := func() { s.reviveTask(t) } // set_goals 新增目标 → 把任务拉回 running
-			// 把上传附件的【绝对路径】清单拼进发给 agent 的消息,它据此用 Read/Bash 打开文件。
-			// taskDir = agent 的工作目录(CWD),与 chatUpload 落盘、ensureRunDir 一致。
-			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
-			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
-			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
-			s.engine.EndLLMCall(t.ID)
-			if err != nil && ctx.Err() == nil {
-				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "(Main Agent error: " + err.Error() + ")", MainSeg: segPtr})
-			}
-		}()
-		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
-		return
-	}
-	reply := s.fallbackChat(t, req.Message)
-	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
-	s.finishTaskChat(t.ID, cancel)
-	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule"})
+	id, _ := strconv.ParseInt(t.ID, 10, 64)
+	s.admitCompatibilityChat(w, r, chatstate.SessionRef{TaskID: id, ExplorationID: t.ExpID, MainSeg: seg}, req.Message, req.Attachments)
 }
 
 func (s *Server) cancelTaskChat(taskID string, cause error) bool {
@@ -4047,24 +3988,36 @@ func (s *Server) stopChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	if !s.cancelTaskChat(t.ID, agent.AbortChatStoppedByUser) {
-		writeJSON(w, 200, map[string]any{"status": "idle"})
+	id, _ := strconv.ParseInt(t.ID, 10, 64)
+	if err := s.m.pg.PauseChatGate(r.Context(), chatstate.SessionRef{TaskID: id, ExplorationID: t.ExpID}, -1); err != nil {
+		chatControlError(w, err)
 		return
 	}
+	s.cancelTaskChat(t.ID, agent.AbortChatStoppedByUser)
 	writeJSON(w, 200, map[string]any{"status": "stopping"})
+}
+
+func steeringCommandText(message string, prefixes ...string) (string, bool) {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(strings.ToLower(message), strings.ToLower(prefix)) {
+			return strings.TrimSpace(message[len(prefix):]), true
+		}
+	}
+	return "", false
 }
 
 // fallbackChat is the no-LLM human-steering handler: simple命令 + 态势摘要.
 func (s *Server) fallbackChat(t *Task, msg string) string {
 	m := strings.TrimSpace(msg)
-	lower := strings.ToLower(m)
+	intentText, intentCommand := steeringCommandText(m, "intent", "의도", "意图")
+	hintText, hintCommand := steeringCommandText(m, "hint", "힌特", "提示")
 	switch {
-	case strings.HasPrefix(lower, "intent"):
-		text := strings.TrimSpace(m[len("intent"):])
+	case intentCommand:
+		text := intentText
 		_, _ = t.Store.AddIntent(map[string]any{"summary": text}, 9, nil, "human")
-		return "Injected a high-priority intent: " + text
-	case strings.HasPrefix(lower, "hint"):
-		text := strings.TrimSpace(m[len("hint"):])
+		return "Added a high-priority intent: " + text
+	case hintCommand:
+		text := hintText
 		_, _ = t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
 		return "Recorded hint, planner will read it on next cycle: " + text
 	default:
@@ -4140,6 +4093,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	msg = toEnglishError(msg)
 	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+func writeError(w http.ResponseWriter, code int, err error) {
+	if err == nil {
+		writeErr(w, code, "")
+		return
+	}
+	writeErr(w, code, err.Error())
 }
 
 func atoiDefault(s string, d int) int {

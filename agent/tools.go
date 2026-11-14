@@ -297,6 +297,7 @@ func (t *ToolSet) DropCoverageTools(tools []actool.CoreTool) []actool.CoreTool {
 // is safe; add_hint is a writeTool but also doesn't deref the context here.)
 func (t *ToolSet) GraphOverviewTool() actool.CoreTool      { return t.graphOverview() }
 func (t *ToolSet) ListFindingsTool() actool.CoreTool       { return t.listFindings() }
+func (t *ToolSet) ReportFindingTool() actool.CoreTool      { return t.addFinding() }
 func (t *ToolSet) GetWorkerTraceTool() actool.CoreTool     { return t.getWorkerTrace() }
 func (t *ToolSet) ListWorkerTracesTool() actool.CoreTool   { return t.listWorkerTraces() }
 func (t *ToolSet) SearchWorkerTracesTool() actool.CoreTool { return t.searchAllWorkerTraces() }

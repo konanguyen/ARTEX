@@ -26,23 +26,31 @@ func noaWarn(session string) func(string) {
 //
 // noa 是实验功能:接入失败不得中断真实任务。发生错误时经 onWarn 上报并回退内置压缩。
 // 启用成功时清掉 opts.Compaction,避免 agentcore 因「两个上下文管理器同时设置」告警。
-func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessionID string, onWarn func(string)) {
+func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessionID string, onWarn func(string)) *noaadapter.Session {
 	if enabled == nil || !enabled() {
-		return
+		return nil
+	}
+	if _, local := opts.Compactor.(*localCompactor); local {
+		if onWarn != nil {
+			onWarn("Native Ollama contexts up to 64K retain the 72% compaction policy; experimental noa is skipped")
+		}
+		return nil
 	}
 	if opts.OnWarn == nil {
 		opts.OnWarn = onWarn
 	}
-	if err := noaadapter.Enable(opts, noaadapter.Options{
+	session, err := noaadapter.EnableWithSession(opts, noaadapter.Options{
 		ArchiveBaseDir: filepath.Join(archiveRoot, "noa"),
 		SessionID:      sessionID,
 		OnWarn:         onWarn,
-	}); err != nil {
+	})
+	if err != nil {
 		if onWarn != nil {
-			onWarn("noa 压缩启用失败,回退内置压缩:" + err.Error())
+			onWarn("Could not enable noa compaction; falling back to built-in compaction: " + err.Error())
 		}
-		return
+		return nil
 	}
-	// Compactor 覆盖 Compaction,但两者并存时 agentcore 每次会告警;明确清掉。
+	// Compactor supersedes Compaction; explicitly clear the latter to avoid repeated warnings.
 	opts.Compaction = nil
+	return session
 }

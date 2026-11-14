@@ -2,21 +2,20 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/sidequestion"
 )
 
 const (
@@ -215,8 +214,12 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.cancelConversation(c.ID)
-	s.cancelSideWhere(func(p sidequestion.Parent) bool { return p.ConversationID == c.ID })
+	drainCtx, stop := context.WithTimeout(r.Context(), taskDeleteDrainTimeout)
+	defer stop()
+	if err := s.drainConversationChat(drainCtx, c.ID); err != nil {
+		chatControlError(w, err)
+		return
+	}
 	if err := pg.DeleteConversation(c.ID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -274,8 +277,13 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	for _, id := range ids {
-		s.cancelConversation(id)
-		s.cancelSideWhere(func(p sidequestion.Parent) bool { return p.ConversationID == id })
+		drainCtx, stop := context.WithTimeout(r.Context(), taskDeleteDrainTimeout)
+		err := s.drainConversationChat(drainCtx, id)
+		stop()
+		if err != nil && !errors.Is(err, chatstate.ErrGone) {
+			chatControlError(w, err)
+			return
+		}
 	}
 	deleted, err := pg.DeleteConversations(ids)
 	if err != nil {
@@ -366,19 +374,15 @@ func (s *Server) pgConversationMsgDetail(w http.ResponseWriter, r *http.Request)
 // the run/stop button in the chat UI). It cancels only THIS session's agent run;
 // the P3 trigger queue is untouched, so the agent's next queued fire still starts.
 func (s *Server) pgStopConversation(w http.ResponseWriter, r *http.Request) {
-	_, c, ok := s.convByID(w, r)
+	pg, c, ok := s.convByID(w, r)
 	if !ok {
 		return
 	}
-	busyKey := s.convBusyKey(c.ID)
-	s.chatMu.Lock()
-	cancel := s.chatCancel[busyKey]
-	s.chatMu.Unlock()
-	if cancel == nil {
-		writeJSON(w, 200, map[string]any{"status": "idle"}) // nothing running
+	if err := pg.PauseChatGate(r.Context(), chatstate.SessionRef{ConversationID: c.ID}, -1); err != nil {
+		chatControlError(w, err)
 		return
 	}
-	cancel(agent.AbortChatStoppedByUser)
+	s.cancelConversation(c.ID)
 	writeJSON(w, 200, map[string]any{"status": "stopping"})
 }
 
@@ -386,124 +390,75 @@ func (s *Server) pgStopConversation(w http.ResponseWriter, r *http.Request) {
 // background (steps stream to conversation_activities, polled by the client). One
 // in-flight turn per conversation.
 func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Request) {
-	pg, c, ok := s.convByID(w, r)
+	_, c, ok := s.convByID(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
 		Message     string           `json:"message"`
-		Attachments []chatAttachment `json:"attachments,omitempty"` // 方式1 上传的文件(路径相对会话工作目录)
+		Attachments []chatAttachment `json:"attachments"`
 	}
-	if err := decode(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	msg := strings.TrimSpace(req.Message)
-	if msg == "" && len(req.Attachments) == 0 {
-		writeErr(w, 400, "Message cannot be empty")
-		return
-	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, msg)
-	if !ok {
-		return
-	}
-	// Same resolution as the background runner: honour the agent binding / this
-	// conversation's chosen profile before falling back to the global config, so a
-	// conversation that picked a valid LLM is not rejected just because no global
-	// config is active.
-	if s.resolveChatAgent(c) == nil {
-		writeErr(w, 503, s.chatUnavailableReason())
-		return
-	}
-
-	busyKey := s.convBusyKey(c.ID)
-	s.chatMu.Lock()
-	if s.chatBusy[busyKey] {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "Conversation is processing the previous message; please wait")
-		return
-	}
-	s.chatBusy[busyKey] = true
-	s.chatMu.Unlock()
-
-	// persist + float the human turn; auto-title the thread from the first message.
-	// Worker is the agent key (not "user") so the transcript stays a single lane
-	// (no worker chips) — the kind='user' already right-aligns it as a human bubble.
-	// With attachments, Detail carries {text, attachments} JSON so the transcript
-	// renders attachment cards; without, Detail is the full text (Summary is truncated,
-	// so the transcript lazy-loads Detail to show the message untruncated).
-	ua := userActivityWithAttachments(c.AgentKey, msg, req.Attachments)
-	ua.Summary = firstLine(msg, 200)
-	if ua.Detail == "" {
-		ua.Detail = msg
-	}
-	if _, err := pg.AppendConvActivity(c.ID, ua); err != nil {
-		log.Printf("[conv %d] append user msg failed: %v", c.ID, err)
-	}
-	if c.Title == "" || c.Title == "New Chat" || c.Title == "新对话" {
-		title := firstLine(msg, 40)
-		if title == "" {
-			title = "Attachment message"
-		}
-		_ = pg.RenameConversation(c.ID, title)
-	}
-	_ = pg.TouchConversation(c.ID)
-
-	// Append the uploaded files' ABSOLUTE paths so the ChatAgent opens them with its
-	// Read/Bash tools. baseDir = the agent's per-session CWD (<workDir>/sessions/
-	// conv-<id>/), matching chatUpload's landing dir and agent/chat.go's sessionWorkDir
-	// — busyKey == convBusyKey(c.ID) == "conv-<id>" == that session id.
-	baseDir := filepath.Join(s.m.dir, "sessions", busyKey)
-	s.runConversation(c, composeAgentMessage(agentMessage, req.Attachments, baseDir), busyKey, msg)
-	writeJSON(w, 202, map[string]any{"status": "accepted"})
+	s.admitCompatibilityChat(w, r, chatstate.SessionRef{ConversationID: c.ID}, req.Message, req.Attachments)
 }
 
-// runConversation runs ONE agent turn on a conversation in a background goroutine
-// (each conversation is independent → parallel). Steps stream to
-// conversation_activities. Shared by the chat HTTP handler and the P3 scheduler.
-// busyKey clears when the run ends (best-effort in-flight marker).
+// Generated inputs use the durable dispatcher too. The trigger scheduler waits
+// for its own admission, never for whichever input happens to claim first.
+func (s *Server) queueExternalConversation(request context.Context, c *db.Conversation, msg, busyKey string) (chatstate.Admission, error) {
+	ref := chatstate.SessionRef{ConversationID: c.ID}
+	key := rand.Text()
+	prompt := chatstate.Prompt{Text: msg}
+	admission, err := s.m.pg.AdmitChatInput(request, ref, key, "send", "", prompt)
+	if err != nil {
+		return chatstate.Admission{}, err
+	}
+	s.dispatchChatGate(ref.GateKey())
+	return admission, nil
+}
+
 func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMessage ...string) {
-	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
-	// Only the human-message handler supplies this field, before adding the
-	// attachment manifest. Scheduler/retest prompts must not be labelled as users.
-	if len(userMessage) == 1 {
-		ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: userMessage[0]})
+	if err := s.runConversationWithContext(s.ctx, c, msg, busyKey, userMessage...); err != nil {
+		log.Printf("[chat %s] admission: %v", busyKey, err)
 	}
-	go s.runConversationTurn(ctx, cancel, c, msg, busyKey)
 }
 
-// runConversationSync runs ONE agent turn on a conversation and BLOCKS until the
-// run ends (clearing busyKey). runConversation wraps it in a goroutine for the
-// fire-and-forget chat path; the P3 trigger queue calls it directly so it can wait
-// for completion before starting the next queued fire for the same agent.
-func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
-	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
-	s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+func (s *Server) runConversationWithContext(request context.Context, c *db.Conversation, msg, busyKey string, userMessage ...string) error {
+	_, err := s.queueExternalConversation(request, c, msg, busyKey)
+	return err
 }
 
-// Register cancellation before returning 202, so an immediate stop/delete cannot
-// miss a background goroutine which has not started yet.
-func (s *Server) conversationRunContext(id int64, busyKey string) (context.Context, context.CancelCauseFunc) {
-	// Per-run cancellable context so a manual stop (pgStopConversation) can abort
-	// just this session. Registered under chatMu so the stop handler can find it.
-	ctx, cancel := context.WithCancelCause(intercept.WithConvID(s.ctx, id))
-	s.chatMu.Lock()
-	s.chatCancel[busyKey] = cancel
-	s.chatMu.Unlock()
-	return ctx, cancel
+func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) error {
+	input, err := s.queueExternalConversation(s.ctx, c, msg, busyKey)
+	if err != nil {
+		return err
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var status string
+		if err = s.m.pg.QueryRowContext(s.ctx, `SELECT status FROM chat_control_inputs WHERE id=$1`, input.ID).Scan(&status); err != nil {
+			return err
+		}
+		if status != "queued" && status != "claimed" {
+			return nil
+		}
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
-func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelCauseFunc, c *db.Conversation, msg, busyKey string) {
-	defer func() {
-		cancel(agent.AbortChatTurnFinished)
-		s.chatMu.Lock()
-		delete(s.chatBusy, busyKey)
-		delete(s.chatCancel, busyKey)
-		s.chatMu.Unlock()
-	}()
+// Retest bookkeeping is shared by first execution and resumed external input.
+// Admission, run finalization and cancellation belong to dispatchChatInput.
+func (s *Server) executeExternalConversation(ctx context.Context, c *db.Conversation, msg string) (runErr error) {
 	// Only the first turn executes a historical retest. Follow-up conversation
 	// turns may explain the sealed result; the result tool refuses to overwrite it.
-	finishStatus, finishReason := "failed", "Retest failed to start"
+	runErr = errors.New("Retest could not start")
+	finishStatus, finishReason := "failed", "Retest could not start"
 	if c.AgentKey == db.FindingRetestAgentKey {
 		// Read without the run cancellation so an immediate stop still seals pending.
 		r, err := s.m.pg.FindingRetestForConversation(context.Background(), c.ID)
@@ -514,62 +469,51 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 			if err := s.m.pg.FailPendingRetestForConversation(c.ID, "Failed to read retest status; please try again"); err != nil {
 				log.Printf("[conv %d] seal retest: %v", c.ID, err)
 			}
-			return
+			return err
 		}
 		if r != nil && r.Status == "pending" {
 			defer func() {
-				if ctx.Err() != nil {
-					finishStatus, finishReason = "stopped", "Retest stopped or service shutdown"
-				}
 				s.finishRetest(r.ID, finishStatus, finishReason)
 			}()
-			if ctx.Err() != nil {
-				return
-			}
-			started, err := s.m.pg.StartFindingRetest(ctx, r.ID)
-			if err != nil {
-				finishReason = err.Error()
-				return
-			}
-			if !started {
-				return
-			}
 		}
 	}
-	if ctx.Err() != nil {
-		return
-	}
-	// precedence: the conversation agent's own binding → this conversation's pin → global.
+
 	ca := s.resolveChatAgent(c)
 	if ca == nil {
 		finishReason = s.chatUnavailableReason()
-		return
+		return errors.New("chat model unavailable")
 	}
-	pg := s.m.pg
+	sessionID := s.convBusyKey(c.ID)
 	maxTurns := s.agentMaxTurns(c.AgentKey)
 	maxDuration := time.Duration(s.agentRunSeconds(c.AgentKey)) * time.Second
 	webSearch := false
+	pg := s.m.pg
 	if a, err := pg.GetAgentByKey(c.AgentKey); err == nil && a != nil {
 		webSearch = a.WebSearch
 	}
-	sessionID := s.convBusyKey(c.ID) // "conv-<id>" transcript session
 	emit := func(rec db.Activity) {
 		if _, err := pg.AppendConvActivity(c.ID, rec); err != nil {
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
 		}
 	}
-	// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
+	// On a manual stop ctx is cancelled; Chat already emits a clean "Stopped manually"
 	// step, so skip the raw-error entry — only surface genuine failures.
 	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+		runErr = err
 		finishReason = err.Error()
+		if errors.Is(err, agent.ErrChatPersistence) {
+			finishStatus = "unknown"
+		}
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
-				Summary: "(Error: " + err.Error() + ")", Detail: err.Error()})
+				Summary: fmt.Sprintf("(Error: %s)", err.Error()), Detail: err.Error()})
 		}
 	} else {
 		finishStatus, finishReason = "completed", ""
+		runErr = nil
 	}
 	_ = pg.TouchConversation(c.ID)
+	return
 }
 
 // triggerBehavior is an agent's cached P3 trigger post-processing策略 (see the
@@ -815,7 +759,9 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
-	s.runConversationSync(c, msg, busyKey)
+	if err := s.runConversationSync(c, msg, busyKey); err != nil {
+		log.Printf("[trigger] durable admission for %s: %v", item.agentKey, err)
+	}
 }
 
 // firstLine returns a single-line, length-capped preview (shared with summaries).
@@ -828,4 +774,10 @@ func firstLine(s string, max int) string {
 		s = string([]rune(s)[:max]) + "…"
 	}
 	return s
+}
+
+// isDefaultConversationTitle recognizes only exact built-in titles, including the
+// legacy Chinese title, so existing empty conversations can still be auto-titled.
+func isDefaultConversationTitle(title string) bool {
+	return title == "" || title == "New Chat" || title == "New conversation" || title == "新对话"
 }
