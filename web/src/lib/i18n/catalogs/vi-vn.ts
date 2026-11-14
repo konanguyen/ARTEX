@@ -2731,6 +2731,7 @@ export const vi: Dictionary = {
   "tasks.detail.paused": "Đã tạm dừng khám phá",
   "tasks.detail.report.copied": "Đã sao chép Markdown",
   "tasks.detail.report.empty": "Chưa có báo cáo",
+  "tasks.detail.report.loadError": "Tải báo cáo thất bại, có thể thử lại",
   "tasks.detail.report.loading": "Đang tải…",
   "tasks.detail.report.title": "Báo cáo kiểm thử xâm nhập (Markdown)",
   "tasks.detail.resume": "Tiếp tục",

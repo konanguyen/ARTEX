@@ -2606,6 +2606,7 @@ export const zhCN: Dictionary = {
   "tasks.detail.paused": "已暂停探索",
   "tasks.detail.report.copied": "已复制 Markdown",
   "tasks.detail.report.empty": "暂无报告",
+  "tasks.detail.report.loadError": "加载报告失败，可重试",
   "tasks.detail.report.loading": "加载中…",
   "tasks.detail.report.title": "渗透测试报告（Markdown）",
   "tasks.detail.resume": "恢复",

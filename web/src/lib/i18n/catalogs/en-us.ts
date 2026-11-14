@@ -2717,6 +2717,7 @@ export const en: Dictionary = {
   "tasks.detail.paused": "Exploration paused",
   "tasks.detail.report.copied": "Markdown copied",
   "tasks.detail.report.empty": "No report available",
+  "tasks.detail.report.loadError": "Failed to load the report; retry available",
   "tasks.detail.report.loading": "Loading…",
   "tasks.detail.report.title": "Penetration Test Report (Markdown)",
   "tasks.detail.resume": "Resume",

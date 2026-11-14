@@ -12,30 +12,42 @@ import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { copyText } from "@/lib/utils";
 
+// A different task must never render or copy the previous task's report: the
+// wrapper remounts the stateful TaskReport per taskId.
 export function ReportTab({ taskId }: { taskId: string }) {
-  const { t } = useI18n();
-  const [report, setReport] = React.useState<string>("");
-  const [loading, setLoading] = React.useState(true);
-  const [copied, setCopied] = React.useState(false);
+  return <TaskReport key={taskId} taskId={taskId} />;
+}
 
+type ReportState = { status: "loading" | "error" } | { status: "ready"; text: string };
+
+function TaskReport({ taskId }: { taskId: string }) {
+  const { t } = useI18n();
+  const [state, setState] = React.useState<ReportState>({ status: "loading" });
+  const [attempt, setAttempt] = React.useState(0);
+  const [copied, setCopied] = React.useState(false);
+  const report = state.status === "ready" ? state.text : "";
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt intentionally restarts the request after an explicit retry.
   React.useEffect(() => {
     let active = true;
-    setLoading(true);
+    setState({ status: "loading" });
     api
       .report(taskId)
       .then((text) => {
-        if (active) setReport(text);
+        if (active) setState({ status: "ready", text });
       })
       .catch(() => {
-        if (active) setReport("");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
+        if (active) setState({ status: "error" });
       });
     return () => {
       active = false;
     };
-  }, [taskId]);
+  }, [taskId, attempt]);
+
+  function retry() {
+    setState({ status: "loading" });
+    setAttempt((current) => current + 1);
+  }
 
   async function copy() {
     if (!report) return;
@@ -50,11 +62,26 @@ export function ReportTab({ taskId }: { taskId: string }) {
   }
 
   let content: React.ReactNode;
-  if (loading) {
+  if (state.status === "loading") {
     content = (
-      <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed py-16 text-muted-foreground text-sm">
+      <div
+        role="status"
+        className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed py-16 text-muted-foreground text-sm"
+      >
         <FileTextIcon className="size-8 opacity-40" />
         {t("tasks.detail.report.loading")}
+      </div>
+    );
+  } else if (state.status === "error") {
+    content = (
+      <div
+        role="alert"
+        className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed py-16 text-sm"
+      >
+        <p>{t("tasks.detail.report.loadError")}</p>
+        <Button size="sm" variant="outline" onClick={retry}>
+          {t("action.retry")}
+        </Button>
       </div>
     );
   } else if (report) {
