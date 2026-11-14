@@ -266,6 +266,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 func (m *Manager) watch(t *Task, f *os.File) {
 	stop := make(chan struct{})
 	go m.watchSize(t, stop)
+	go m.taskRSSWatchdog(t, stop)
 
 	err := t.cmd.Wait()
 	close(stop)

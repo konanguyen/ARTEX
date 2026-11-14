@@ -44,7 +44,9 @@ func TestShippedSkillsParseCleanly(t *testing.T) {
 			t.Errorf("skill %s: empty description after parse", e.Name())
 		}
 	}
-	// codeaudit ships upstream (PLAN 6.1); this repo ships bbot-recon instead.
+	if _, ok := byDir["codeaudit"]; !ok {
+		t.Error("codeaudit skill missing from shipped skills")
+	}
 	if _, ok := byDir["bbot-recon"]; !ok {
 		t.Error("bbot-recon skill missing from shipped skills")
 	}

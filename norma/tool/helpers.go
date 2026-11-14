@@ -3,6 +3,7 @@ package tool
 import (
 	"fmt"
 	"os"
+	"unicode/utf8"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -42,12 +43,26 @@ func Capture(tc *ToolContext, s string) string {
 				}
 			}
 			lines := strings.Count(s, "\n") + 1
-			return s[:max] + fmt.Sprintf(
+			return utf8Floor(s, max) + fmt.Sprintf(
 				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
 				len(s), lines, ref)
 		}
 	}
 	return truncate(s, max)
+}
+
+// utf8Floor cuts s at no more than n bytes, backing the cut point up to a rune
+// boundary so the result is always valid UTF-8. CJK output (the bulk of this
+// product's prose) is 3 bytes per rune: a blind byte cut split a rune and the
+// invalid tail then corrupted everything downstream that assumed UTF-8.
+func utf8Floor(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // alreadyCaptured reports whether s already carries a marker Capture leaves
@@ -94,11 +109,18 @@ func resolvePath(tc *ToolContext, p string) string {
 	return filepath.Join(tc.WorkingDir, p)
 }
 
-// truncate trims s to max characters, keeping head and tail.
+// truncate trims s to max characters, keeping head and tail. The cut points
+// back up to a rune boundary (utf8Floor / utf8Ceil) so the result stays valid
+// UTF-8 no matter where the byte budget lands inside a multi-byte rune.
 func truncate(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
 	half := max / 2
-	return s[:half] + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + s[len(s)-half:]
+	head := utf8Floor(s, half)
+	tail := s[len(s)-half:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return head + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + tail
 }

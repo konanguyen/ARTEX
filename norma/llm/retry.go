@@ -19,6 +19,15 @@ import (
 // Count comes from cfg.retries(), the wait between attempts from
 // cfg.retryDelay() (exponential by default, fixed when Config.RetryInterval is set).
 func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeaders func(*http.Request), errPrefix string) (*http.Response, error) {
+	// A caller that never went through NewProvider (tests, direct use) still
+	// gets a working client instead of a nil deref at the first request.
+	if cfg.HTTPClient == nil {
+		client, err := defaultHTTPClient(cfg.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		cfg.HTTPClient = client
+	}
 	// Rate limit once per logical request (outside the retry loop, so retries do
 	// not consume additional tokens). Shared across all callers of this provider.
 	if err := cfg.limiter.Wait(ctx); err != nil {
