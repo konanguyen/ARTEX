@@ -12,8 +12,8 @@ import (
 func TestDeferredSystem_NoGlobal(t *testing.T) {
 	// No global MCP names → plain single-segment system, no cache boundary.
 	sys, boundary := deferredSystem("SYS", DeferredInfo{})
-	if len(sys) != 1 || sys[0] != "SYS" || boundary != 0 {
-		t.Fatalf("expected [SYS],0 — got %v,%d", sys, boundary)
+	if len(sys) != 1 || sys[0] != "SYS" || boundary != 1 {
+		t.Fatalf("expected [SYS],1 (the static system segment is cached too) — got %v,%d", sys, boundary)
 	}
 }
 

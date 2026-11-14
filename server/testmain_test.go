@@ -13,6 +13,11 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	// The background notifier delivery loop claims deliveries concurrently with
+	// tests that drive stepRealtime/stepDigest directly, corrupting per-delivery
+	// attempt accounting. Suite-wide off; notify tests drive the steps themselves.
+	os.Setenv(notifyBackgroundDisabledEnv, "1")
+
 	// Fixed test key via env: NewManager's InitSecrets then writes no key file.
 	os.Setenv("ARTEX_SECRET_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	dsn, _, err := db.DSN()

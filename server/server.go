@@ -267,7 +267,12 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
-		go newNotifier(s).Run(s.ctx)
+		// Integration tests drive stepRealtime/stepDigest directly and need the
+		// distribution deterministic: the 3s background loop must not race them
+		// for the same deliveries. Unset = production behavior unchanged.
+		if os.Getenv(notifyBackgroundDisabledEnv) == "" {
+			go newNotifier(s).Run(s.ctx)
+		}
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.

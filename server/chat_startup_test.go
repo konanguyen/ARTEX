@@ -48,8 +48,8 @@ func TestChatStartupRecoveryPrecedesDueTrigger(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	oldAugment, oldResolve, oldPrompt := agent.ToolAugment, agent.ToolResolve, agent.PromptOverride
-	defer func() { agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt }()
+	oldAugment, oldResolve, oldPrompt := agent.ToolAugment(), agent.ToolResolve(), agent.PromptOverride()
+	defer func() { agent.SetToolAugment(oldAugment); agent.SetToolResolve(oldResolve); agent.SetPromptOverride(oldPrompt) }()
 	type startupResult struct {
 		s   *Server
 		err error

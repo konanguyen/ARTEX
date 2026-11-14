@@ -105,6 +105,10 @@ type notifyBucket struct {
 	lastFill time.Time
 }
 
+// notifyBackgroundDisabledEnv stops the background delivery loop from
+// starting (test switch; integration tests drive the steps directly).
+const notifyBackgroundDisabledEnv = "ARTEX_NOTIFY_BACKGROUND_DISABLED"
+
 func newNotifier(s *Server) *Notifier {
 	return &Notifier{s: s, pg: s.m.pg, buckets: map[int64]*notifyBucket{}}
 }

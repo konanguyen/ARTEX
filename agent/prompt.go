@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"log"
 	"bytes"
 	"sync"
 	"text/template"

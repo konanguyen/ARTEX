@@ -227,16 +227,16 @@ func TestChatControlsE2E(t *testing.T) {
 	if err = m.pg.SetActiveProfile(profileID); err != nil {
 		t.Fatal(err)
 	}
-	oldAugment, oldResolve, oldPrompt := agent.ToolAugment, agent.ToolResolve, agent.PromptOverride
-	defer func() { agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt }()
+	oldAugment, oldResolve, oldPrompt := agent.ToolAugment(), agent.ToolResolve(), agent.PromptOverride()
+	defer func() { agent.SetToolAugment(oldAugment); agent.SetToolResolve(oldResolve); agent.SetPromptOverride(oldPrompt) }()
 	var serverMu sync.Mutex
 	var app *Server
 	var stop context.CancelFunc
 	start := func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		next := New(ctx, m, m.dir, m.dir, m.dir)
-		augment := agent.ToolAugment
-		agent.ToolAugment = func(ctx context.Context, key string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
+		augment := agent.ToolAugment()
+		agent.SetToolAugment(func(ctx context.Context, key string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 			tools, def, cleanup := augment(ctx, key)
 			if key == "auto" || key == "mainagent" {
 				for _, name := range []string{"FixtureWait", "FixtureMarker"} {
@@ -265,7 +265,7 @@ func TestChatControlsE2E(t *testing.T) {
 				}
 			}
 			return tools, def, cleanup
-		}
+		})
 		serverMu.Lock()
 		app, stop = next, cancel
 		serverMu.Unlock()

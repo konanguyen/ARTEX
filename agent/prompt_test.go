@@ -21,7 +21,7 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 		}
 		return "", false
 	})
-	if got := renderSystem("planner", "DEFAULT", PlannerVars{Goal: "capture X", Scope: "*.x.com"}); got != "Goal:capture X Scope:*.x.com" {
+	if got := renderSystem("planner", "DEFAULT", PlannerVars{Goal: "拿下X", Scope: "*.x.com"}); got != "目标:拿下X 范围:*.x.com" {
 		t.Fatalf("override render: %q", got)
 	}
 
@@ -32,11 +32,10 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	}
 
 	// full plannerSystem path: DB body [A] is honored, then the code-owned tail
-	// [C] (intermediate artifact output rules) is ALWAYS appended — editing the body
-	// can't drop it.
+	// [C] (中间产物输出规约) is ALWAYS appended — editing the body can't drop it.
 	SetPromptOverride(func(k string) (string, bool) { return "PLANNER {{.Goal}}", true })
-	got := plannerSystem("capture X", "/data", "/data")
-	if !strings.HasPrefix(got, "PLANNER capture X") {
+	got := plannerSystem("拿下X", "/data", "/data")
+	if !strings.HasPrefix(got, "PLANNER 拿下X") {
 		t.Fatalf("plannerSystem body not honored: %q", got)
 	}
 	if !strings.Contains(got, "中间产物输出规约") || !strings.Contains(got, "/data") {
@@ -49,7 +48,7 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	// block is gated on the CA (arg 2), NOT on ProxyAddr — a global egress proxy
 	// with capture off routes traffic but records nothing.
 	SetPromptOverride(func(k string) (string, bool) {
-		return "{{if .ProxyAddr}}via proxy {{.ProxyAddr}}{{else}}manual{{end}}", true
+		return "{{if .ProxyAddr}}走代理 {{.ProxyAddr}}{{else}}手动{{end}}", true
 	})
 	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data")
 	if !strings.HasPrefix(recording, "走代理 127.0.0.1:8080") {

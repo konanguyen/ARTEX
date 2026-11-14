@@ -19,11 +19,11 @@ import (
 
 func TestPentestChatPersistsFindingsWithoutTask(t *testing.T) {
 	m := backportTestManager(t)
-	oldAugment, oldResolve, oldPrompt := agent.ToolAugment, agent.ToolResolve, agent.PromptOverride
-	oldBinding := agent.FindingTrafficBindingEnabled
+	oldAugment, oldResolve, oldPrompt := agent.ToolAugment(), agent.ToolResolve(), agent.PromptOverride()
+	oldBinding := agent.FindingTrafficBindingEnabled()
 	t.Cleanup(func() {
-		agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt
-		agent.FindingTrafficBindingEnabled = oldBinding
+		agent.SetToolAugment(oldAugment); agent.SetToolResolve(oldResolve); agent.SetPromptOverride(oldPrompt)
+		agent.SetFindingTrafficBindingEnabled(oldBinding)
 	})
 	s := New(t.Context(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	conv, err := m.pg.CreateConversation("pentest", "Standalone finding fixture", nil)

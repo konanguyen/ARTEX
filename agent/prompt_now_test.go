@@ -38,7 +38,7 @@ func TestChatDataDirVarRenders(t *testing.T) {
 	defer func() { SetPromptOverride(prev) }()
 
 	SetPromptOverride(func(key string) (string, bool) {
-		return "Data root: {{.DataDir}}", true
+		return "数据根目录：{{.DataDir}}", true
 	})
 
 	out := chatSystem("tec_benchmark", "/app/data", "/tmp/x")
@@ -54,7 +54,7 @@ func TestChatUnknownVarFallsBack(t *testing.T) {
 	defer func() { SetPromptOverride(prev) }()
 
 	SetPromptOverride(func(key string) (string, bool) {
-		return "References a nonexistent variable: {{.Bogus}}", true
+		return "引用了不存在的变量：{{.Bogus}}", true
 	})
 
 	out := chatSystem("whatever", "/app/data", "/tmp/x")
