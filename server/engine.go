@@ -142,6 +142,7 @@ type Engine struct {
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
 	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	budgets      sync.Map // taskID -> *agent.BudgetLedger, run budget meter (nil = no budget configured; see engine_budget.go)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
@@ -285,6 +286,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+	e.budgets.Delete(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
@@ -528,6 +530,9 @@ type steerHooks struct {
 	limit int
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
+	// budget meters this intent's run (nil = no budget). Once exhausted, every tool
+	// but the write-back ones is refused with the wrap-up instruction.
+	budget *agent.IntentMeter
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -568,6 +573,9 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 	if msg, ok := h.drain(); ok {
 		return true, "[Planner Real-time Steering] " + msg +
 			"\n(This is an immediate instruction from the planner for this intent; the current tool call was not executed. Please adjust your next step accordingly. If it conflicts with your current plan, this instruction takes precedence.)", nil
+	}
+	if h.budget != nil && agent.BudgetWrapupBlocks(name) && h.budget.Exhausted() {
+		return true, agent.WorkerBudgetWrapup, nil
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
@@ -857,6 +865,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
+		// Run budget (off by default): no worker affordable any more → the forced
+		// wrap-up (once) instead of a normal round.
+		if e.budgetStop(ctx, t) {
+			return
+		}
 		log.Printf("[planner] task %s planning... (triggered by %s)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
@@ -866,8 +879,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		pctx := e.budgetRoundCtx(ectx, t, false)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
@@ -884,6 +898,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s planning finished", t.ID)
+		}
+		if e.budgetBlocksClaim(t.ID) {
+			t.Notify() // this round crossed the budget: settle on the next round, not at the next heartbeat
 		}
 		e.touch(t.ID)
 	}
@@ -990,6 +1007,12 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务超时收尾中:不再领新意图(在跑的自行收尾,协调器等其 drain)
 		}
+		if e.budgetBlocksClaim(t.ID) {
+			if sleepCtx(ctx, 1000*time.Millisecond) {
+				return
+			}
+			continue // run budget below one worker's estimate: dispatch no new worker (the planner loop settles the task)
+		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
 			if sleepCtx(ctx, 1000*time.Millisecond) {
 				return
@@ -1064,6 +1087,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	label := fmt.Sprintf("%s · #%d", name, iid)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
+	// Run budget (off by default): meter this run's calls; its effective budget is
+	// min(intent budget, task remaining above the wrap-up reserve).
+	workCtx, meter := e.budgetIntent(workCtx, t.ID)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
@@ -1072,6 +1098,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
+		budget: meter,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)

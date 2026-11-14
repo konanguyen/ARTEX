@@ -153,7 +153,7 @@ Tài liệu này theo dõi lộ trình port từng tính năng từ hai nhánh f
     - `ingest_bbot`: đọc file JSONL của `bbot`, tự động tách sự kiện trong scope (`scope_distance == 0`) để chèn asset và sự kiện ngoài scope thành fact tình báo; tự lọc bỏ thông tin nhạy cảm `userinfo` trong URL (`#222`).
   - **File chính**: `agent/scan_ingest.go`, `agent/scan_ingest_tool.go`, `agent/bbot_ingest.go`, `agent/bbot_ingest_tool.go`, `agent/tools_insert.go`.
 
-- [ ] **5.2. Sổ cái Độ phủ (`Coverage Ledger` — `record_coverage`) & Ngân sách chạy phân cấp (`Hierarchical Budgets`) (`BaaRai #206, #207`)**
+- [x] **5.2. Sổ cái Độ phủ (`Coverage Ledger` — `record_coverage`) & Ngân sách chạy phân cấp (`Hierarchical Budgets`) (`BaaRai #206, #207`)**
   - **Mô tả**:
     - Công cụ `record_coverage` và bảng `coverage_ledger` ghi lại các bề mặt & nhóm rủi ro đã kiểm tra (`reported`, `no_issue_found`, `ruled_out`, `not_applicable`, `needs_follow_up`).
     - Ngân sách phân cấp `task -> intent -> planner round` (`agent/budget.go`, tắt mặc định) tự động dừng mở rộng và chuyển sang vòng `wrap-up` khi cạn ngân sách.

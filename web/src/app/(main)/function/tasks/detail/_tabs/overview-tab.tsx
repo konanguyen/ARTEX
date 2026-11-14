@@ -124,6 +124,8 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     tested: number;
     pct: number | null;
     by_type: { type: string; total: number; tested: number }[];
+    gaps?: { kind: string; surface?: string; risk_area: string }[];
+    completeness?: { complete: boolean; state: string; caveat: string };
   } | null>(null);
   // 正在重跑的意图 id（含 "__all__" 表示批量），用于禁用按钮 + 转圈。
   const [rerunning, setRerunning] = React.useState<Set<string>>(new Set());
@@ -710,7 +712,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardContent>
       </Card>
       <TaskInterceptRulesCard taskId={taskId} />
-      {coverage && coverage.enabled && coverage.scope_rows > 0 && (
+      {coverage && coverage.enabled && (coverage.scope_rows > 0 || (coverage.gaps?.length ?? 0) > 0) && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
@@ -719,15 +721,19 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            <div className="flex items-baseline gap-3">
-              <span className="text-2xl font-semibold tabular-nums">
-                {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
-              </span>
-              <span className="text-muted-foreground text-sm">
-                {t("tasks.detail.overview.testedRatio", { tested: coverage.tested, total: coverage.denominator })}
-              </span>
-            </div>
-            {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}
+            {coverage.scope_rows > 0 && (
+              <>
+                <div className="flex items-baseline gap-3">
+                  <span className="text-2xl font-semibold tabular-nums">
+                    {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
+                  </span>
+                  <span className="text-muted-foreground text-sm">
+                    {t("tasks.detail.overview.testedRatio", { tested: coverage.tested, total: coverage.denominator })}
+                  </span>
+                </div>
+                {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}
+              </>
+            )}
             {coverage.by_type.length > 0 && (
               <div className="flex flex-wrap gap-1.5 text-xs">
                 {coverage.by_type.map((b) => (
@@ -738,6 +744,23 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     </span>
                   </span>
                 ))}
+              </div>
+            )}
+            {coverage.completeness && !coverage.completeness.complete && (
+              <p className="text-muted-foreground text-xs">{coverage.completeness.caveat}</p>
+            )}
+            {coverage.gaps && coverage.gaps.length > 0 && (
+              <div className="text-xs">
+                <span className="font-medium">{t("coverage.gaps", { count: coverage.gaps.length })}</span>
+                <ul className="text-muted-foreground mt-1 list-disc pl-4 space-y-0.5">
+                  {coverage.gaps.map((g, i) => (
+                    <li key={i}>
+                      <span className="font-mono text-[11px] text-amber-600 dark:text-amber-400">[{g.kind}]</span>{" "}
+                      {g.surface ? <span className="font-medium text-foreground">{g.surface} </span> : null}
+                      <span>{g.risk_area}</span>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
           </CardContent>

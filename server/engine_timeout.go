@@ -91,6 +91,23 @@ func (e *Engine) resetTimeoutRevival(taskID string) {
 	e.coordStarted.Delete(taskID)
 }
 
+// resetSettledRun clears the settle state of a finished run (settling and the
+// budget ledger) so a revived task can plan and claim again with a fresh budget.
+// It also clears the persisted end_reason of the previous run (ApplyTaskAdmission
+// already did in the same UPDATE as the revive; this is idempotent and never
+// touches a task that is terminal again).
+func (e *Engine) resetSettledRun(taskID string) {
+	e.settling.Delete(taskID)
+	e.budgets.Delete(taskID)
+	if e.m != nil && e.m.pg != nil {
+		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
+			if err := e.m.pg.ClearRunEndReason(n); err != nil {
+				log.Printf("[budget] task %s failed to clear end_reason: %v", taskID, err)
+			}
+		}
+	}
+}
+
 // stampFirstRun records first_run_at + deadline_at on the FIRST real run (LLM ready)
 // of a timeout task, once per process. No-op when the task has no timeout.
 func (e *Engine) stampFirstRun(t *Task) {
@@ -175,17 +192,23 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 			}
 			continue
 		}
-		e.settleTask(ctx, t)
+		e.settleTask(ctx, t, false)
 		return
 	}
 }
 
-// settleTask runs the ordered settle sequence once (§4 steps ①–⑥).
-func (e *Engine) settleTask(ctx context.Context, t *Task) {
+// settleTask runs the ordered settle sequence once (§4 steps ①–⑥). budget = the
+// task run budget is exhausted (budget.go) instead of the deadline: same sequence,
+// the final round carries the budget wrap-up words.
+func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
 	if !e.markSettling(t.ID) {
 		return
 	}
-	log.Printf("[deadline] task %s reached timeout limit, entering settlement sequence", t.ID)
+	if budget {
+		log.Printf("[budget] task %s run budget exhausted, entering the settle sequence", t.ID)
+	} else {
+		log.Printf("[deadline] task %s reached timeout limit, entering settlement sequence", t.ID)
+	}
 
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);
 	// 超过 grace 仍未清空 → 硬 cancel 该任务 exec ctx(settling-aware 分支正确归类)。
@@ -203,19 +226,28 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	}
 
 	// ⑤ 终局一轮 planner(任务超时词,最后目标判定,不产新意图)。
-	met := e.runFinalPlannerRound(ctx, t)
+	met := e.runFinalPlannerRound(ctx, t, budget)
 	if !e.beginTaskOperation(t.ID) {
 		return
 	}
 	defer e.decInflight(t.ID)
 
 	// ⑥ 定终态(带守卫):met → done(completed);否则 timeout。若常规路径已先落 done,
-	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
+	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。A budget-exhausted run reuses the
+	// timeout state (a resource limit ended it; no new task status), is marked by an
+	// activity record, and stores tasks.end_reason=budget with the status (read back by
+	// the coverage ledger's completeness; cleared when a revive starts a new run).
 	status := "timeout"
 	if met {
 		status = "done"
 	}
-	won, err := e.m.SetTaskStatusGuarded(t.ID, status)
+	endReason := ""
+	if budget {
+		endReason = db.EndReasonBudget
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: "Task run budget exhausted: forced wrap-up done, task stopped (final state " + status + ")"})
+	}
+	won, err := e.m.SetTaskStatusGuarded(t.ID, status, endReason)
 	switch {
 	case err != nil:
 		log.Printf("[deadline] task %s persist terminal status failed: %v", t.ID, err)
@@ -229,7 +261,7 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
-func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
+func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool) (met bool) {
 	if e.IsDeleting(t.ID) {
 		return false
 	}
@@ -247,14 +279,19 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		planner, _ = e.snapshotFor(t)
 	}
 	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
+	fctx := e.clockCtx(ctx, t, !budget)
+	label := "task timeout settle"
+	if budget {
+		fctx = e.budgetRoundCtx(fctx, t, true)
+		label = "task budget settle"
+	}
 	if !e.beginTaskOperation(t.ID) {
 		return false
 	}
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-		Summary: fmt.Sprintf("Task timeout wrap-up · final judgment (round %d)", e.nextPlannerRound(t.ID))})
+		Summary: fmt.Sprintf("%s · final judgment (round %d)", label, e.nextPlannerRound(t.ID))})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)

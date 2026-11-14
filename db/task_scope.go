@@ -319,6 +319,9 @@ type Coverage struct {
 	Tested      int              `json:"tested"`      // 已测(约)
 	Pct         *float64         `json:"pct"`         // 覆盖度；分母 0 时 null
 	ByType      []CoverageByType `json:"by_type"`     // 按资产类型的 总数/已测
+	// Coverage ledger (entries, gaps, unexamined, findings_by_class, completeness),
+	// flattened into the same document; nil when the feature is off.
+	*CoverageLedger
 }
 
 // CoverageEnabled reports whether a task has the asset-coverage feature turned on

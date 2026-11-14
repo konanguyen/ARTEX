@@ -380,7 +380,7 @@ export const api = {
   // ---- stats ----
   stats: (task?: string) => get<Stats>(`/stats${tq(task)}`),
   // 资产测试覆盖度(粗估，供参考)：范围内资产被 fact 碰过的占比 + 按类型的 总数/已测。
-  taskCoverage: (id: string) =>
+  taskCoverage: (id: string | number) =>
     get<{
       enabled: boolean; // 资产覆盖度功能是否开启；false 时其余字段为零值
       scope_rows: number;
@@ -388,6 +388,9 @@ export const api = {
       tested: number;
       pct: number | null;
       by_type: { type: string; total: number; tested: number }[];
+      // coverage ledger (absent when the feature is off): gaps = open items; an unexamined class is never clean
+      gaps?: { kind: string; surface?: string; risk_area: string }[];
+      completeness?: { complete: boolean; state: string; caveat: string };
     }>(`/tasks/${id}/coverage`),
   // 资产覆盖图：范围内全部资产 + 连接用的根域名/公司节点，含 tested/in_scope。
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
