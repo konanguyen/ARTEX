@@ -392,3 +392,50 @@ func TestScanIngestItemCap(t *testing.T) {
 			len(s.Assets)+len(s.Facts), s.Events, s.OverCap, s.Truncated, scanMaxItems, scanMaxItems/2)
 	}
 }
+
+// ---- subdive -json ----
+
+const subdiveFixture = `{
+  "domain": "subdive.example.com",
+  "generated": "2026-11-15T05:00:00+0000",
+  "total": 3,
+  "resolved": 2,
+  "records": [
+    {"subdomain":"app.subdive.example.com","status":"resolved","ipv4":"203.0.113.10,198.51.100.2","ipv6":"","cname":"","http_status":"200","title":"App Login","server":"nginx","sources":"crt.sh,otx","new_vs_baseline":"yes","ptr":"ptr.subdive.example.com"},
+    {"subdomain":"www.subdive.example.com","status":"resolved","ipv4":"203.0.113.11","ipv6":"","cname":"app.subdive.example.com","http_status":"301","title":"","server":"","sources":"dnstdumpster","new_vs_baseline":"","ptr":""},
+    {"subdomain":"dead.subdive.example.com","status":"nx","ipv4":"","ipv6":"","cname":"","http_status":"","title":"","server":"","sources":"brute","new_vs_baseline":"","ptr":""}
+  ]
+}`
+
+// Two resolved names: two subdomain assets (with the first A record) and two
+// facts carrying the fingerprint; the NX name is counted and skipped.
+func TestScanIngestSubdive(t *testing.T) {
+	s := parseScan(t, "subdive-json", subdiveFixture)
+	if got := fmt.Sprint([]int{s.Events, len(s.hosts), s.Skipped, len(s.Facts), len(s.Assets)}); got != "[3 3 1 2 2]" {
+		t.Fatalf("events,hosts,skipped,facts,assets = %s", got)
+	}
+	checkScanFacts(t, s)
+	if a := s.Assets; a[0].Type != "subdomain" || a[0].Domain != "app.subdive.example.com" || a[0].IP != "203.0.113.10" ||
+		a[1].Domain != "www.subdive.example.com" || a[1].IP != "203.0.113.11" {
+		t.Fatalf("subdive assets %+v", a)
+	}
+	if d, _ := strconv.Unquote(s.Facts[0].Detail); !strings.Contains(d, `"sources":"crt.sh,otx"`) || !strings.Contains(d, `"new_vs_baseline":"yes"`) {
+		t.Fatalf("subdive fact detail lost provenance: %s", d)
+	}
+	if s.Truncated || s.Oversized != 0 {
+		t.Fatalf("truncated=%v oversized=%d", s.Truncated, s.Oversized)
+	}
+}
+
+// A report cut short keeps the records read before the cut; a file that is not
+// JSON is refused.
+func TestScanIngestSubdiveTruncated(t *testing.T) {
+	cut := subdiveFixture[:strings.Index(subdiveFixture, `"cname":"app.subdive.example.com"`)+10]
+	s := parseScan(t, "subdive-json", cut)
+	if !s.Truncated || s.Events != 1 || len(s.Facts) != 1 {
+		t.Fatalf("truncated subdive: truncated=%v events=%d facts=%d", s.Truncated, s.Events, len(s.Facts))
+	}
+	if err := readSubdiveJSON(strings.NewReader("not a scanner file"), newScanIngest()); err == nil {
+		t.Fatal("a file that is not JSON must be refused")
+	}
+}

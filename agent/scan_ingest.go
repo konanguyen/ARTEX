@@ -504,3 +504,115 @@ func (s *scanIngest) addFfuf(raw json.RawMessage) {
 	s.fact(fmt.Sprintf("ffuf: %s returned status %d, %d bytes, %d words, %d lines", u, r.Status, r.Length, r.Words, r.Lines),
 		map[string]any{"input": r.Input, "redirectlocation": stripUserinfo(r.Redirect)})
 }
+
+// ---- subdive -json ----
+
+// subdiveRecord is one entry of the records[] array in a subdive report's
+// JSON output (konanguyen/subdive): a discovered subdomain with its DNS
+// resolution state and optional HTTP fingerprint.
+type subdiveRecord struct {
+	Subdomain string `json:"subdomain"`
+	Status    string `json:"status"`
+	IPv4      string `json:"ipv4"`
+	IPv6      string `json:"ipv6"`
+	CNAME     string `json:"cname"`
+	HTTP      string `json:"http_status"`
+	Title     string `json:"title"`
+	Server    string `json:"server"`
+	Sources   string `json:"sources"`
+	New       string `json:"new_vs_baseline"`
+	Ptr       string `json:"ptr"`
+}
+
+// readSubdiveJSON walks the top-level object and decodes records[] one element
+// at a time, like readFfufJSON. Other keys (domain, generated, totals,
+// dns_records) are skipped. A file cut short keeps the records read before the
+// cut and is marked truncated.
+func readSubdiveJSON(r io.Reader, s *scanIngest) error {
+	dec := json.NewDecoder(r)
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return errors.New("not a JSON object")
+	}
+	err := func() error {
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			if key != "records" {
+				var skip json.RawMessage
+				if err := dec.Decode(&skip); err != nil {
+					return err
+				}
+				continue
+			}
+			if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+				return errors.New("records is not an array")
+			}
+			for dec.More() {
+				var raw json.RawMessage
+				if err := dec.Decode(&raw); err != nil {
+					return err
+				}
+				s.addSubdive(raw)
+			}
+			if _, err := dec.Token(); err != nil { // ']'
+				return err
+			}
+		}
+		_, err := dec.Token() // '}'
+		return err
+	}()
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		s.Truncated = true
+		return nil
+	}
+	return err
+}
+
+// addSubdive records one subdive record: a resolved name becomes a subdomain
+// asset (with its first A record when present) and one fact carrying the
+// fingerprint (status, title, server, sources, CNAME, PTR, baseline delta).
+// Unresolved names are counted and skipped — a name that does not resolve is
+// not an asset the graph can hang anything on.
+func (s *scanIngest) addSubdive(line []byte) {
+	var r subdiveRecord
+	if s.full() {
+		return
+	}
+	if json.Unmarshal(line, &r) != nil {
+		s.Skipped++
+		return
+	}
+	host := strings.ToLower(strings.TrimSpace(scanHostOf(r.Subdomain)))
+	if host == "" {
+		s.Skipped++
+		return
+	}
+	s.Events++
+	s.hosts[host] = true
+	if r.Status != "resolved" {
+		s.Skipped++
+		return
+	}
+	item := assetInputItem{Type: "subdomain", Domain: host}
+	for _, ip := range strings.Split(r.IPv4, ",") {
+		if ip = strings.TrimSpace(ip); ip != "" && net.ParseIP(ip) != nil {
+			item.IP = ip
+			break
+		}
+	}
+	s.Assets = append(s.Assets, item)
+	summary := fmt.Sprintf("subdive: %s resolved (sources: %s)", host, r.Sources)
+	if r.HTTP != "" {
+		summary += fmt.Sprintf(", HTTP %s", r.HTTP)
+	}
+	if r.Title != "" {
+		summary += ", title quoted in detail"
+	}
+	s.note("subdomains", host)
+	s.fact(summary,
+		map[string]any{"subdomain": host, "ipv4": r.IPv4, "ipv6": r.IPv6, "cname": r.CNAME,
+			"http_status": r.HTTP, "title": r.Title, "server": r.Server, "sources": r.Sources,
+			"new_vs_baseline": r.New, "ptr": r.Ptr})
+}

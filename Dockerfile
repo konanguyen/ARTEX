@@ -51,6 +51,11 @@ ARG FFUF_VERSION=v2.3.0
 ARG DALFOX_VERSION=v3.2.4
 ARG SQLMAP_VERSION=1.9.9
 ARG SQLMAP_COMMIT=cceda39208b5aad478de2c3f731df4239d9881f6
+# subdive (konanguyen/subdive, repo-owned): deep passive subdomain enumeration
+# as a PyInstaller onefile release binary — no venv, no pip at runtime. The
+# SecLists wordlist is pre-baked so the binary never downloads it at run time.
+ARG SUBDIVE_VERSION=v1.0.0
+ARG SUBDIVE_WORDLIST_SHA256=685fad386d19c3b7ecbcd18645606bc5c47a3b2339fa3d79f44c46bd9e79c1ef
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git unzip \
     && rm -rf /var/lib/apt/lists/*
@@ -86,6 +91,26 @@ RUN set -eux; \
       "ffuf_${FFUF_VERSION#v}_linux_${FFUF_ARCH}.tar.gz" "ffuf_${FFUF_VERSION#v}_checksums.txt" ffuf; \
     fetch "$gh/hahwul/dalfox/releases/download/$DALFOX_VERSION" \
       "dalfox-${DALFOX_VERSION}-linux-${DALFOX_ARCH}-musl.tar.gz" "dalfox-${DALFOX_VERSION}-linux-${DALFOX_ARCH}-musl.tar.gz.sha256" dalfox; \
+    fetch_bin() { base="$1"; asset="$2"; sums="$3"; name="$4"; \
+      curl -fsSL "$base/$asset" -o "/tmp/$asset"; \
+      curl -fsSL "$base/$sums" -o /tmp/sums.txt; \
+      want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' /tmp/sums.txt)"; \
+      if [ -z "$want" ]; then echo "no checksum entry for $asset" >&2; exit 1; fi; \
+      got="$(sha256sum "/tmp/$asset" | cut -d' ' -f1)"; \
+      if [ "$want" != "$got" ]; then echo "checksum mismatch for $asset: want $want got $got" >&2; exit 1; fi; \
+      install -m 0755 "/tmp/$asset" "/out/$name"; \
+      rm -f "/tmp/$asset" /tmp/sums.txt; }; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) SUBDIVE_ARCH=x86_64 ;; \
+      arm64) SUBDIVE_ARCH=aarch64 ;; \
+    esac; \
+    fetch_bin "$gh/konanguyen/subdive/releases/download/$SUBDIVE_VERSION" \
+      "subdive-linux-${SUBDIVE_ARCH}" "SHA256SUMS" subdive; \
+    mkdir -p /opt/subdive/wordlists; \
+    curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-20000.txt" \
+      -o /opt/subdive/wordlists/subdomains-top1million-20000.txt; \
+    wgot="$(sha256sum /opt/subdive/wordlists/subdomains-top1million-20000.txt | cut -d' ' -f1)"; \
+    if [ "$wgot" != "$SUBDIVE_WORDLIST_SHA256" ]; then echo "wordlist checksum mismatch: want $SUBDIVE_WORDLIST_SHA256 got $wgot" >&2; exit 1; fi; \
     git clone --quiet --depth 1 --branch "$SQLMAP_VERSION" https://github.com/sqlmapproject/sqlmap /opt/sqlmap; \
     commit="$(git -C /opt/sqlmap rev-parse HEAD)"; \
     if [ "$commit" != "$SQLMAP_COMMIT" ]; then echo "sqlmap commit mismatch: want $SQLMAP_COMMIT got $commit" >&2; exit 1; fi; \
@@ -109,10 +134,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 每个工具跑一次版本命令确认可执行。
 COPY --from=tools /out/ /usr/local/bin/
 COPY --from=tools /opt/sqlmap /opt/sqlmap
+COPY --from=tools /opt/subdive /opt/subdive
 RUN set -eux; \
     ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap; \
     nuclei -version >/dev/null; httpx -version; subfinder -version; katana -version; \
-    ffuf -V >/dev/null; dalfox --version >/dev/null; sqlmap --version >/dev/null
+    ffuf -V >/dev/null; dalfox --version >/dev/null; sqlmap --version >/dev/null; \
+    subdive --version >/dev/null
 
 # bbot 递归 recon 编排器（upstream #117）：blacklanternsecurity/bbot，AGPL-3.0
 # （与本仓库同许可；独立 CLI 依赖，不与本代码链接）。钉住版本、独立 venv 隔离

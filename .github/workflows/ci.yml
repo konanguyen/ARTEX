@@ -1,0 +1,72 @@
+name: ci
+
+# Merge gate for every push and pull request: the forks this repo integrates
+# (BaaRai, cskwork, jiwoo) all run tests on CI; this repo previously only built
+# releases on tags. Two jobs: the Go backend with a PostgreSQL service, and the
+# web frontend (tsc via the static build, vitest, i18n key-parity guard).
+# The release workflow (release.yml) stays tag-triggered and unchanged.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: artex
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: artextest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U artex"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ARTEX_PG_DSN: postgres://artex:testpass@localhost:5432/artextest?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      # -p 1: package test suites share the single postgres service; running
+      # them in parallel makes packages delete each other's rows. Serial package
+      # execution keeps the database state deterministic.
+      - run: go test -p 1 ./...
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --ignore-scripts
+      # tsc --noEmit is the type gate; the static export build itself stays in
+      # release.yml so CI stays fast.
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: npm run check:i18n
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck is preinstalled on the ubuntu runners.
+      - run: shellcheck -S warning install.sh start.sh scripts/backup.sh reset-password.sh
