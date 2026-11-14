@@ -1180,8 +1180,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			if err := t.ts.ProveGoal(goal, ev); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {

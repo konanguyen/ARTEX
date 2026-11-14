@@ -152,7 +152,7 @@ type RuleForm = {
   enabled: boolean;
   priority: number;
   match_target: "tool_name" | "tool_input";
-  match_type: "string" | "regex";
+  match_type: "string" | "regex" | "argv";
   pattern: string;
   action: InterceptAction;
   message: string;
@@ -174,6 +174,17 @@ const defaultForm = (): RuleForm => ({
   timeout_seconds: 60,
   timeout_action: "deny",
 });
+
+// An argv pattern (JSON array of tokens) shown as a prefix: ["nmap"] -> "nmap *".
+function argvLabel(pattern: string): string {
+  try {
+    const tokens: unknown = JSON.parse(pattern);
+    if (Array.isArray(tokens)) return `${tokens.join(" ")} *`;
+  } catch {
+    // not a JSON array: show the raw pattern
+  }
+  return pattern;
+}
 
 // ---- small components ----
 
@@ -201,10 +212,11 @@ const FOLLOW_ACTIVE = "0"; // profile_id 0 = 跟随激活/默认配置
 
 const defaultJudge = (): JudgeConfig => ({
   enabled: false,
+  mode: "closed",
   profile_id: 0,
   prompt: "",
   timeout_seconds: 15,
-  fail_action: "allow",
+  fail_action: "ask",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
 });
@@ -377,6 +389,15 @@ function JudgeCard() {
                           {p.name}（{p.model}）
                         </SelectItem>
                       ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+                <Field label={t("intercept.judge.mode")}>
+                  <Select value={cfg.mode ?? "closed"} onValueChange={(v) => patch({ mode: v as JudgeConfig["mode"] })}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="closed">{t("intercept.judge.mode.closed")}</SelectItem>
+                      <SelectItem value="freeform">{t("intercept.judge.mode.freeform")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </Field>
@@ -716,12 +737,16 @@ export default function InterceptPage() {
                     </TableCell>
                     <TableCell>
                       <span className="text-xs text-muted-foreground">
-                        {rule.match_type === "regex" ? t("intercept.rules.type.regex") : t("intercept.rules.type.string")}
+                        {rule.match_type === "regex"
+                          ? t("intercept.rules.type.regex")
+                          : rule.match_type === "argv"
+                            ? t("intercept.rules.type.argv")
+                            : t("intercept.rules.type.string")}
                       </span>
                     </TableCell>
                     <TableCell className="max-w-[220px]">
                       <code className="block truncate rounded bg-muted px-1.5 py-0.5 text-xs font-mono">
-                        {rule.pattern}
+                        {rule.match_type === "argv" ? argvLabel(rule.pattern) : rule.pattern}
                       </code>
                     </TableCell>
                     <TableCell>
@@ -810,19 +835,24 @@ export default function InterceptPage() {
             <Field label={t("intercept.sheet.matchType.label")}>
               <Select
                 value={form.match_type}
-                onValueChange={(v) => set({ match_type: v as RuleForm["match_type"] })}
+                onValueChange={(v) => {
+                  const match_type = v as RuleForm["match_type"];
+                  // An argv rule always matches the Bash command in tool_input.
+                  set(match_type === "argv" ? { match_type, match_target: "tool_input" } : { match_type });
+                }}
               >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="string">{t("intercept.sheet.matchType.string")}</SelectItem>
                   <SelectItem value="regex">{t("intercept.sheet.matchType.regex")}</SelectItem>
+                  <SelectItem value="argv">{t("intercept.sheet.matchType.argv")}</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
 
             <Field label={t("intercept.sheet.pattern.label")}>
               <Input
-                placeholder={form.match_type === "regex" ? "^Bash$" : "rm -rf"}
+                placeholder={form.match_type === "regex" ? "^Bash$" : form.match_type === "argv" ? '["git","push"]' : "rm -rf"}
                 value={form.pattern}
                 onChange={(e) => set({ pattern: e.target.value })}
                 className={regexErr ? "border-destructive focus-visible:ring-destructive" : ""}
@@ -832,6 +862,11 @@ export default function InterceptPage() {
               )}
               {regexWarn && (
                 <p className="text-xs text-amber-600 mt-1">{t("intercept.sheet.pattern.regexWarn")}</p>
+              )}
+              {form.match_type === "argv" && (
+                <p className="text-xs text-amber-600 mt-1">
+                  {t("intercept.sheet.pattern.argvHint", { prefix: argvLabel(form.pattern) })}
+                </p>
               )}
             </Field>
 

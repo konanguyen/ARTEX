@@ -122,6 +122,28 @@ function StatusBadge({ status }: { status: string }) {
   return <Badge variant={variant}>{labels[status] ?? status}</Badge>;
 }
 
+// decided_by is shown exactly as stored, so a row always sits under the
+// "Decided by" filter option matching its badge. A decided row without an actor
+// predates the column: it reads "Legacy" and matches no option.
+function DecidedByBadge({ row }: { row: InterceptApprovalRow }) {
+  const { t } = useI18n();
+  if (row.status === "pending") return <span className="text-muted-foreground">—</span>;
+  if (!row.decided_by) {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        {t("approval.decidedBy.legacy")}
+      </Badge>
+    );
+  }
+  const labels: Record<string, string> = {
+    human: t("approval.decidedBy.human"),
+    rule: t("approval.decidedBy.rule"),
+    model: t("approval.decidedBy.model"),
+    system: t("approval.decidedBy.system"),
+  };
+  return <Badge variant="outline">{labels[row.decided_by] ?? row.decided_by}</Badge>;
+}
+
 function MatchCell({ row, showReason = true }: { row: InterceptApprovalRow; showReason?: boolean }) {
   const { t } = useI18n();
   const reason = row.reason?.replace(/^\[(?:模型|Model)\]\s*/i, "");
@@ -303,6 +325,32 @@ function DecisionActions({ row, busy, decide }: { row: InterceptApprovalRow; bus
   );
 }
 
+// AlwaysAllowAction creates an argv allow rule from a pending Bash request.
+// The prefix comes from the server; the request itself stays pending.
+function AlwaysAllowAction({ id, prefix }: { id: number; prefix?: string }) {
+  const { t } = useI18n();
+  const [busy, setBusy] = React.useState(false);
+  async function create() {
+    setBusy(true);
+    try {
+      const res = await api.interceptAlwaysAllow(id);
+      toast.success(res.created ? t("approval.alwaysAllow.created") : t("approval.alwaysAllow.exists"));
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <Button size="sm" variant="outline" className="self-start" disabled={busy} onClick={() => void create()}>
+        {prefix ? t("approval.alwaysAllow.buttonPrefix", { prefix }) : t("approval.alwaysAllow.button")}
+      </Button>
+      <p className="text-muted-foreground text-xs">{t("approval.alwaysAllow.hint")}</p>
+    </div>
+  );
+}
+
 export function ApprovalDetail({
   row,
   busy,
@@ -409,6 +457,10 @@ export function ApprovalDetail({
             <dd>{fmtTime(row.created_at)}</dd>
             <dt className="text-muted-foreground">{t("approval.th.decidedAt")}</dt>
             <dd>{fmtTime(current.decided_at)}</dd>
+            <dt className="text-muted-foreground">{t("approval.th.decidedBy")}</dt>
+            <dd>
+              <DecidedByBadge row={current} />
+            </dd>
             {audit?.rule_name ? (
               <>
                 <dt className="text-muted-foreground">{t("approval.detail.ruleSnapshot")}</dt>
@@ -423,6 +475,9 @@ export function ApprovalDetail({
             ) : null}
           </dl>
           {!readOnly ? <DecisionActions row={current} busy={busy} decide={decide} /> : null}
+          {!readOnly && current.status === "pending" && row.tool_name === "Bash" ? (
+            <AlwaysAllowAction id={row.id} prefix={detail?.always_allow_prefix} />
+          ) : null}
         </div>
       </div>
       {error ? (
@@ -515,6 +570,12 @@ export function ApprovalDetail({
                 label={`${initialLabel}：${actionLabels[audit.initial_action] ?? audit.initial_action}`}
                 text={audit.initial_reason.replace(/^\[(?:模型|Model)\]\s*/i, "")}
               />
+              {audit.judge_answers?.length ? (
+                <CodeBlock
+                  label={t("approval.detail.judgeAnswers")}
+                  text={audit.judge_answers.map((a) => `${a.id}: ${a.answer}${a.evidence ? ` - ${a.evidence}` : ""}`).join("\n")}
+                />
+              ) : null}
               <CodeBlock
                 label={t("approval.detail.executionOutput")}
                 text={audit.output ?? (audit.execution_status === "not_executed" ? t("approval.detail.toolNotExecuted") : t("approval.detail.noExecutionOutput"))}
@@ -556,10 +617,10 @@ function subscribeColumns(onChange: () => void) {
 }
 function visibleColumnCount() {
   const matches = approvalBreakpoints.map((query) => window.matchMedia(query).matches);
-  return 3 + Number(matches[0]) + Number(matches[1]) + 2 * Number(matches[2]) + 2 * Number(matches[3]);
+  return 3 + Number(matches[0]) + Number(matches[1]) + 3 * Number(matches[2]) + 2 * Number(matches[3]);
 }
 function serverColumnCount() {
-  return 9;
+  return 10;
 }
 
 function ApprovalTable({
@@ -600,6 +661,7 @@ function ApprovalTable({
           <TableHead className="hidden lg:table-cell">{t("approval.th.rule")}</TableHead>
           <TableHead className="hidden xl:table-cell">{t("approval.th.args")}</TableHead>
           <TableHead className="w-24">{t("approval.th.status")}</TableHead>
+          <TableHead className="hidden w-24 lg:table-cell">{t("approval.th.decidedBy")}</TableHead>
           <TableHead className="hidden w-36 lg:table-cell">{t("approval.th.appliedAt")}</TableHead>
           <TableHead className="hidden w-36 xl:table-cell">{t("approval.th.decidedAt")}</TableHead>
         </TableRow>
@@ -653,6 +715,9 @@ function ApprovalTable({
                 <TableCell>
                   <StatusBadge status={row.status} />
                 </TableCell>
+                <TableCell className="hidden lg:table-cell">
+                  <DecidedByBadge row={row} />
+                </TableCell>
                 <TableCell className="hidden text-muted-foreground text-xs lg:table-cell">
                   {fmtTime(row.created_at)}
                 </TableCell>
@@ -694,7 +759,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
   const request = React.useRef(0);
   const decisionLock = React.useRef(false);
   const filterID = React.useId();
-  const filtered = Boolean(filter.status || filter.decision_source);
+  const filtered = Boolean(filter.status || filter.decision_source || filter.decided_by);
 
   // A task can stay mounted while the user switches between task details.
   // Reset the cursor so the new scope always starts at its newest records.
@@ -780,7 +845,9 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
       // Optimistically drop the decided item from the independent pending queue
       // for instant feedback; the re-fetch below reconciles with server truth.
       setRows((prev) =>
-        prev.map((row) => (row.id === id ? { ...row, status: decision, decided_at: new Date().toISOString() } : row)),
+        prev.map((row) =>
+          row.id === id ? { ...row, status: decision, decided_by: "human", decided_at: new Date().toISOString() } : row,
+        ),
       );
       setPendingRows((prev) => prev.filter((row) => row.id !== id));
       setRevision((v) => v + 1);
@@ -867,6 +934,31 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
                 <SelectItem value="model">{t("approval.filter.model")}</SelectItem>
                 <SelectItem value="rule">{t("approval.filter.rule")}</SelectItem>
                 <SelectItem value="unknown">{t("approval.filter.unknown")}</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field className="w-full sm:w-40">
+          <FieldLabel htmlFor={`${filterID}-decided-by`}>{t("approval.filter.decidedBy")}</FieldLabel>
+          <Select
+            value={filter.decided_by ?? "all"}
+            onValueChange={(value) =>
+              changeFilter({
+                ...filter,
+                decided_by: value === "all" ? undefined : (value as InterceptApprovalFilter["decided_by"]),
+              })
+            }
+          >
+            <SelectTrigger id={`${filterID}-decided-by`}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="all">{t("approval.filter.allActors")}</SelectItem>
+                <SelectItem value="model">{t("approval.filter.actorModel")}</SelectItem>
+                <SelectItem value="human">{t("approval.filter.actorHuman")}</SelectItem>
+                <SelectItem value="rule">{t("approval.filter.actorRule")}</SelectItem>
+                <SelectItem value="system">{t("approval.filter.actorSystem")}</SelectItem>
               </SelectGroup>
             </SelectContent>
           </Select>

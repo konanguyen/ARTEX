@@ -1,7 +1,9 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -292,5 +294,79 @@ func TestNodesPageQueryMatchesID(t *testing.T) {
 		t.Fatal(err)
 	} else if total != 0 || len(nodes) != 0 {
 		t.Fatalf("non-existent id: total=%d nodes=%+v, want empty", total, nodes)
+	}
+}
+
+func TestProveGoalAtomic(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("prove_goal tx test", "goal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+
+	es := d.Exploration(expID)
+	goalID, err := es.AddGoal(map[string]any{"text": "atomic goal"}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	factID, err := es.AddNode(KindFact, map[string]any{"summary": "proof"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE exploration_nodes SET blocked_reason='pending proof' WHERE id=$1`, goalID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-goal or missing node IDs must fail with a clear error without leaving edges.
+	for _, badGoal := range []int64{factID, goalID + 999999} {
+		err := es.ProveGoal(badGoal, factID)
+		if err == nil || !strings.Contains(err.Error(), "goal not found") {
+			t.Fatalf("ProveGoal(%d): got err=%v, want 'goal not found'", badGoal, err)
+		}
+		var edges int
+		if err := d.QueryRow(`SELECT count(*) FROM exploration_edges WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4`,
+			expID, factID, RelProves, badGoal).Scan(&edges); err != nil {
+			t.Fatal(err)
+		}
+		if edges != 0 {
+			t.Fatalf("failed ProveGoal(%d) left %d proof edge(s)", badGoal, edges)
+		}
+	}
+
+	var beforeVer int64
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goalID).Scan(&beforeVer); err != nil {
+		t.Fatal(err)
+	}
+
+	// Happy path + idempotence.
+	for attempt := int64(1); attempt <= 2; attempt++ {
+		if err := es.ProveGoal(goalID, factID); err != nil {
+			t.Fatalf("ProveGoal attempt %d: %v", attempt, err)
+		}
+		var state string
+		var blocked sql.NullString
+		var ver int64
+		var edges int
+		if err := d.QueryRow(`SELECT state, blocked_reason, content_version FROM exploration_nodes WHERE id=$1`, goalID).
+			Scan(&state, &blocked, &ver); err != nil {
+			t.Fatal(err)
+		}
+		if state != "met" || blocked.Valid || ver != beforeVer+attempt {
+			t.Fatalf("attempt %d: state=%q blocked=%+v ver=%d (want met, NULL, %d)",
+				attempt, state, blocked, ver, beforeVer+attempt)
+		}
+		if err := d.QueryRow(`SELECT count(*) FROM exploration_edges WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4`,
+			expID, factID, RelProves, goalID).Scan(&edges); err != nil {
+			t.Fatal(err)
+		}
+		if edges != 1 {
+			t.Fatalf("attempt %d: edges=%d, want 1", attempt, edges)
+		}
 	}
 }

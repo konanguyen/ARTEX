@@ -25,6 +25,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -753,6 +754,11 @@ func (s *Server) pgListTools(w http.ResponseWriter, r *http.Request) {
 	if ts == nil {
 		ts = []*db.Tool{}
 	}
+	for _, tool := range ts {
+		if !tool.System {
+			tool.Exec = maskToolExec(tool.Exec)
+		}
+	}
 	// Usage is best-effort decoration. Runtime tool resolution keeps using the plain
 	// catalog query, so agent assembly never pays for this aggregate.
 	counts, countErr := pg.ToolUsageCounts()
@@ -857,7 +863,98 @@ func (s *Server) pgListMCP(w http.ResponseWriter, r *http.Request) {
 	if ms == nil {
 		ms = []*db.MCPServer{}
 	}
+	for _, m := range ms {
+		m.Env = maskMCPEnv(m.Env)
+	}
 	writeJSON(w, 200, map[string]any{"servers": ms})
+}
+
+// maskedSecret is what a response shows for a stored secret such as a proxy
+// URL: the whole value is replaced by the placeholder, "" stays "".
+func maskedSecret(v string) string {
+	if v == "" {
+		return ""
+	}
+	return notify.MaskedPrefix
+}
+
+// isMaskedSecret reports a placeholder sent back on write: keep the stored value.
+func isMaskedSecret(v string) bool { return notify.IsMasked(strings.TrimSpace(v)) }
+
+// keepIfMasked turns a placeholder in an optional field into nil (keep).
+func keepIfMasked(v *string) *string {
+	if v != nil && isMaskedSecret(*v) {
+		return nil
+	}
+	return v
+}
+
+// maskMCPEnv replaces every non-empty env value (API keys, auth headers) with
+// notify.MaskedPrefix so the API never returns it in clear.
+func maskMCPEnv(raw json.RawMessage) json.RawMessage {
+	var env map[string]any
+	if json.Unmarshal(raw, &env) != nil || env == nil {
+		return json.RawMessage(`{}`)
+	}
+	for k, v := range env {
+		if v != "" {
+			env[k] = notify.MaskedPrefix
+		}
+	}
+	out, _ := json.Marshal(env)
+	return out
+}
+
+// unmaskMCPEnv puts the stored value back for every env key sent as the mask,
+// so a client echoing the list response never overwrites the stored secret.
+// As in notify.PrepareConfigUpdate, a stored secret is only kept for the
+// destination it was configured for: when transport, command, args or url
+// change, every env value must be re-entered (or cleared) explicitly.
+func unmaskMCPEnv(pg *db.DB, m *db.MCPServer) error {
+	var env, storedEnv map[string]any
+	if json.Unmarshal(m.Env, &env) != nil {
+		return nil // not an object: SaveMCP stores or rejects it as before
+	}
+	all, err := pg.ListMCP()
+	if err != nil {
+		return err
+	}
+	var stored *db.MCPServer
+	for _, cur := range all {
+		if m.ID != 0 && cur.ID == m.ID {
+			stored = cur
+			_ = json.Unmarshal(cur.Env, &storedEnv)
+		}
+	}
+	moved := stored != nil && (stored.Transport != m.Transport || stored.Command != m.Command ||
+		stored.URL != m.URL || canonicalMCPArgs(stored.Args) != canonicalMCPArgs(m.Args))
+	for k, v := range env {
+		if s, ok := v.(string); ok && notify.IsMasked(s) {
+			old, ok := storedEnv[k]
+			if !ok {
+				return fmt.Errorf("env %q: masked value but nothing stored to keep", k)
+			}
+			if moved {
+				return fmt.Errorf("the MCP destination (transport, command, args or url) changed: re-enter the env values (%q is masked) or clear them; stored secrets are not sent to a new destination", k)
+			}
+			env[k] = old
+		}
+	}
+	m.Env, err = json.Marshal(env)
+	return err
+}
+
+// canonicalMCPArgs normalizes args JSON for comparison; empty means [] as in SaveMCP.
+func canonicalMCPArgs(raw json.RawMessage) string {
+	var v any
+	if len(raw) == 0 || string(raw) == "null" {
+		return "[]"
+	}
+	if json.Unmarshal(raw, &v) != nil {
+		return string(raw)
+	}
+	out, _ := json.Marshal(v)
+	return string(out)
 }
 
 func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
@@ -871,6 +968,10 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNew := m.ID == 0
+	if err := unmaskMCPEnv(pg, &m); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -1809,6 +1910,16 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	// The list returns the proxy masked: the placeholder sent back keeps the
+	// stored proxy and is never stored itself.
+	if isMaskedSecret(p.Proxy) {
+		stored, err := pg.ProfileByID(p.ID)
+		if p.ID == 0 || err != nil || stored == nil {
+			writeErr(w, 400, "proxy is a masked placeholder but no stored proxy to keep; enter the proxy or clear it")
+			return
+		}
+		p.Proxy = stored.Proxy
+	}
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
@@ -1818,6 +1929,12 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	ua, err := agent.ValidateUserAgent(p.UserAgent)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	p.UserAgent = ua
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2055,6 +2172,14 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "API Key is required"})
 		return
+	}
+	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: use the stored one
+		req.Proxy = ""
+		if req.ProfileID != nil {
+			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+				req.Proxy = p.Proxy
+			}
+		}
 	}
 
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")

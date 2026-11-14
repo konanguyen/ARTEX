@@ -8,9 +8,9 @@ import (
 	"strings"
 )
 
-// TaskScope is one row of a task's test scope — the coverage denominator and the
-// per-task authorization edge. Rows come either from insertAssets (source='auto',
-// conservative, one per explicitly-inserted asset) or from the add_task_scope tool
+// TaskScope is one row of a task's declared test scope — the coverage denominator
+// and asset-record filter, not a network boundary. Rows come either from insertAssets
+// (source='auto', conservative, one per explicitly-inserted asset) or from the add_task_scope tool
 // (source='agent', for company / domain / network / ICP / keyword scope).
 type TaskScope struct {
 	ID        int64  `json:"id"`
@@ -102,8 +102,9 @@ func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
 }
 
 // AddAutoScope records the conservative task scope implied by ONE explicitly-inserted
-// asset item (source='auto'). MUST be called only from insertAssets' top-level loop —
-// never from a db-layer side effect (linkHostAssets), so派生资产不会盲目扩大范围。
+// asset item (source='auto'). Call only after the asset gate, from insertAssets'
+// top-level loop or worker intent startup, never from a db-layer side effect
+// (linkHostAssets), so derived assets cannot blindly expand scope.
 // Rule: scope granularity follows the asset's own type. taskID<=0 → no-op.
 func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip string) error {
 	if taskID <= 0 {
@@ -213,6 +214,41 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 		ts.Value = parsed.Value
 	default:
 		return ts, fmt.Errorf("unsupported kind: %s (company/root_domain/subdomain/ip/cidr/icp/keyword)", kind)
+	}
+	if source != "manual" {
+		block, err := s.db.ListAssetInterceptRules()
+		if err != nil {
+			return ts, fmt.Errorf("asset interception validation failed: %w", err)
+		}
+		taskBlock, allow, err := s.TaskInterceptRulesSplit(taskID)
+		if err != nil {
+			return ts, fmt.Errorf("asset interception validation failed: %w", err)
+		}
+		block = append(block, taskBlock...)
+		var domains, ips []string
+		if ts.Domain != "" {
+			domains = []string{ts.Domain}
+		}
+		if ts.Net != "" {
+			_, network, _ := net.ParseCIDR(ts.Net) // Validated above; check both saved network endpoints.
+			last := append(net.IP(nil), network.IP...)
+			for i := range last {
+				last[i] |= ^network.Mask[i]
+			}
+			ips = []string{network.IP.String(), last.String()}
+		}
+		if len(ips) == 0 {
+			if decision := EvaluateAssetGate(block, allow, domains, nil, nil); !decision.Allowed {
+				return ts, fmt.Errorf("%s", decision.Reason)
+			}
+		} else {
+			// Unlike asset candidates, every CIDR endpoint must pass the allowlist.
+			for _, ip := range ips {
+				if decision := EvaluateAssetGate(block, allow, nil, []string{ip}, nil); !decision.Allowed {
+					return ts, fmt.Errorf("%s", decision.Reason)
+				}
+			}
+		}
 	}
 	if err := s.upsertTaskScope(ts); err != nil {
 		return ts, err

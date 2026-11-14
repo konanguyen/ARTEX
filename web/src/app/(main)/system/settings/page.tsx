@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, ZapIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -41,6 +41,8 @@ export default function SystemSettingsPage() {
   const [pyInterp, setPyInterp] = React.useState("");
   const [workers, setWorkers] = React.useState("3");
   const [savingWorkers, setSavingWorkers] = React.useState(false);
+  const [maxConcurrent, setMaxConcurrent] = React.useState("0");
+  const [savingMaxConcurrent, setSavingMaxConcurrent] = React.useState(false);
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
@@ -60,6 +62,7 @@ export default function SystemSettingsPage() {
     setGlobalProxyInput(s.global_proxy ?? "");
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
+    setMaxConcurrent(String(s.llm_max_concurrent ?? 0));
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
@@ -80,6 +83,27 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => toast.error(t("common.saveFailed", { message: (e as Error).message })))
       .finally(() => setSavingWorkers(false));
+  };
+
+  const saveMaxConcurrent = () => {
+    if (maxConcurrent.trim() === "") {
+      toast.error(t("settings.llmMaxConcurrentInvalid"));
+      return;
+    }
+    const n = Number(maxConcurrent);
+    if (!Number.isInteger(n) || n < 0) {
+      toast.error(t("settings.llmMaxConcurrentInvalid"));
+      return;
+    }
+    setSavingMaxConcurrent(true);
+    api
+      .setSettings({ llm_max_concurrent: n })
+      .then((s) => {
+        apply(s);
+        toast.success(t("settings.llmMaxConcurrentSaved", { count: n }));
+      })
+      .catch((e) => toast.error(t("common.saveFailed", { message: (e as Error).message })))
+      .finally(() => setSavingMaxConcurrent(false));
   };
 
   const savePython = () => {
@@ -634,6 +658,34 @@ export default function SystemSettingsPage() {
               />
               <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
                 {t("action.save")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ZapIcon className="size-4" />
+              {t("settings.llmMaxConcurrentTitle")}
+            </CardTitle>
+            <CardDescription>
+              {t("settings.llmMaxConcurrentDesc")}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                className="w-32 font-mono text-sm"
+                placeholder="0"
+                value={maxConcurrent}
+                disabled={!loaded || savingMaxConcurrent}
+                onChange={(e) => setMaxConcurrent(e.target.value)}
+              />
+              <Button onClick={saveMaxConcurrent} disabled={!loaded || savingMaxConcurrent}>
+                {savingMaxConcurrent ? t("action.saving") : t("action.save")}
               </Button>
             </div>
           </CardContent>

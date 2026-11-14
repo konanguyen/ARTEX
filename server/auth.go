@@ -2,18 +2,23 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/Autumn-27/artex/config"
 )
 
 const (
@@ -26,7 +31,9 @@ const (
 	// lives only in the frontend is as good as none: hitting the API directly bypasses
 	// it. The upper bound is bcrypt's hard limit: past 72 bytes GenerateFromPassword
 	// returns ErrPasswordTooLong; rejecting early beats a cryptic "password encryption failed".
-	minPasswordRunes = 8
+	// Both apply to new passwords only (init, change-password); login never checks
+	// length, so passwords set under the old 8-character minimum still log in.
+	minPasswordRunes = 12
 	maxPasswordBytes = 72
 )
 
@@ -46,28 +53,38 @@ func validatePassword(pw string) string {
 	return ""
 }
 
+// jwtLegacyBaseDir is the second legacy key location (the executable's directory,
+// where releases before ARTEX_JWT_KEY_DIR wrote the key). A var so tests can point it
+// at a temp dir.
+var jwtLegacyBaseDir = config.BaseDir
+
 // loadOrCreateJWTKey reads the 32-byte signing key from keyDir/jwt.key. keyDir is
-// the project base dir (next to the executable), NOT the browsable workspace root
-// (dataDir) — the signing key must never be listable/downloadable via the file
-// manager. Legacy installs kept it at dataDir/jwt.key; if present there and not yet
-// at the new location, it is migrated (key preserved, so sessions stay valid) and
-// the old file removed so it disappears from the workspace. On first run a random
-// key is generated and persisted.
+// ARTEX_JWT_KEY_DIR (the /app/keys volume in Docker) or the project base dir, NOT
+// the browsable workspace root (dataDir) — the signing key must never be
+// listable/downloadable via the file manager. When keyDir/jwt.key is missing, a key
+// at dataDir/jwt.key, then at BaseDir()/jwt.key, is migrated (key preserved, so
+// sessions stay valid) and the old file removed. Otherwise a random key is
+// generated. An existing key file is never overwritten.
 func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
+	if err := os.MkdirAll(keyDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create jwt key dir: %w", err)
+	}
 	path := filepath.Join(keyDir, jwtKeyFilename)
-	// one-time migration out of the old in-workspace location.
-	if legacy := filepath.Join(dataDir, jwtKeyFilename); legacy != path {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if data, rerr := os.ReadFile(legacy); rerr == nil {
-				if werr := os.WriteFile(path, data, 0o600); werr == nil {
-					_ = os.Remove(legacy)
-					log.Printf("[auth] JWT key migrated from %s to %s (moved outside browsable workspace)", legacy, path)
-				}
-			}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := migrateJWTKey(path, dataDir); err != nil {
+			return nil, err
 		}
 	}
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
-		return []byte(strings.TrimSpace(string(data))), nil
+	data, err := os.ReadFile(path)
+	if err == nil {
+		key := strings.TrimSpace(string(data))
+		if len(key) < 32 {
+			return nil, fmt.Errorf("jwt key %s is shorter than 32 bytes; fix or remove it (it is never overwritten)", path)
+		}
+		return []byte(key), nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read jwt key: %w", err)
 	}
 	buf := make([]byte, 32)
 	for i := range buf {
@@ -77,11 +94,69 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 		}
 		buf[i] = keyChars[n.Int64()]
 	}
-	if err := os.WriteFile(path, buf, 0600); err != nil {
+	if err := writeNewJWTKey(path, buf); err != nil {
 		return nil, fmt.Errorf("write jwt key: %w", err)
 	}
 	log.Printf("[auth] new JWT key written to %s", path)
 	return buf, nil
+}
+
+// migrateJWTKey copies the first legacy key found (dataDir, then BaseDir) to dst
+// and removes the old file. Candidates equal to dst are skipped.
+func migrateJWTKey(dst, dataDir string) error {
+	for _, src := range []string{
+		filepath.Join(dataDir, jwtKeyFilename),
+		filepath.Join(jwtLegacyBaseDir(), jwtKeyFilename),
+	} {
+		if samePath(src, dst) {
+			continue
+		}
+		data, err := os.ReadFile(src)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			log.Printf("[auth] cannot read legacy JWT key %s: %v", src, err)
+			continue
+		}
+		if err := writeNewJWTKey(dst, data); err != nil {
+			return fmt.Errorf("migrate jwt key from %s: %w", src, err)
+		}
+		if err := os.Remove(src); err != nil {
+			log.Printf("[auth] JWT key copied to %s but the old file %s could not be removed: %v", dst, src, err)
+		}
+		log.Printf("[auth] JWT key migrated from %s to %s", src, dst)
+		return nil
+	}
+	return nil
+}
+
+// writeNewJWTKey creates path with mode 0600, failing if it already exists.
+func writeNewJWTKey(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+func samePath(a, b string) bool {
+	if absA, err := filepath.Abs(a); err == nil {
+		a = absA
+	}
+	if absB, err := filepath.Abs(b); err == nil {
+		b = absB
+	}
+	return a == b
 }
 
 // signJWT issues a 7-day HS256 token for user ARTEX.
@@ -155,7 +230,37 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
+// initSetupToken generates the one-time setup token when no admin password is set
+// and writes it to the server log. Without it, anyone who can reach the port
+// before the operator could claim the instance through POST /api/auth/init.
+func (s *Server) initSetupToken() {
+	if s.m == nil || s.m.pg == nil {
+		return
+	}
+	if hash, _, err := s.m.pg.GetSetting(authPassKey); err == nil && hash != "" {
+		return
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		log.Fatalf("[auth] generate setup token: %v", err)
+	}
+	tok := hex.EncodeToString(buf)
+	s.setupMu.Lock()
+	s.setupToken = tok
+	s.setupMu.Unlock()
+	log.Printf("[auth] no admin password is set. Setup token for the /setup page: %s", tok)
+}
+
+// checkSetupToken compares got with the active setup token in constant time.
+// It fails when no token is active.
+func (s *Server) checkSetupToken(got string) bool {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	return s.setupToken != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.setupToken)) == 1
+}
+
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
+// Requires the setup token from the server log.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -171,10 +276,16 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setup_token"`
 	}
 	if err := decode(r, &req); err != nil || req.Password == "" {
 		localizedErr(w, r, 400, "Password cannot be empty")
+		return
+	}
+	// 403, not 401: the frontend treats any 401 as an expired session and redirects to /login.
+	if !s.checkSetupToken(req.SetupToken) {
+		writeErr(w, 403, "Invalid setup token. The server log prints it at startup while no password is set")
 		return
 	}
 	if msg := validatePassword(req.Password); msg != "" {
@@ -199,6 +310,9 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		localizedErr(w, r, 403, "Password already set")
 		return
 	}
+	s.setupMu.Lock()
+	s.setupToken = ""
+	s.setupMu.Unlock()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to generate token")
@@ -266,6 +380,21 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	s.login(w, r, pg.GetSetting)
+}
+
+// login is authLogin past the data-source check; getSetting is pg.GetSetting,
+// a parameter so tests can run it without PostgreSQL. Every attempt counts
+// against the caller's IP (s.loginLimit, keyed by clientIP) and a successful
+// one clears it. There is no per-account lockout and no password length check here.
+func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(string) (string, bool, error)) {
+	ip := clientIP(r, s.trustedProxies)
+	if wait := s.loginLimit.allow(ip); wait > 0 {
+		secs := int((wait + time.Second - 1) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeErr(w, 429, fmt.Sprintf("Too many login attempts, try again in %d seconds", secs))
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -278,7 +407,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		localizedErr(w, r, 401, "Invalid username or password")
 		return
 	}
-	hash, ok, err := pg.GetSetting(authPassKey)
+	hash, ok, err := getSetting(authPassKey)
 	if err != nil {
 		localizedErr(w, r, 503, errDataSourceUnavailable)
 		return
@@ -291,6 +420,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		localizedErr(w, r, 401, "Invalid username or password")
 		return
 	}
+	s.loginLimit.reset(ip)
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		localizedErr(w, r, 500, "Failed to generate token")

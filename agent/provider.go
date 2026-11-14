@@ -74,6 +74,11 @@ type Config struct {
 	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
 	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
 	SessionHeaderKey string
+	// UserAgent, when non-empty, overrides the User-Agent header on every outbound
+	// LLM request built from this config. Empty = don't override (keep the default
+	// "artex" UA unless the caller explicitly set User-Agent on the request).
+	// Validated by ValidateUserAgent.
+	UserAgent string
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
@@ -284,7 +289,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClientWithUserAgent(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -363,29 +368,36 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// userAgent, when non-empty, overrides the User-Agent header on every request.
+	// Empty leaves the existing default ("artex" unless explicitly set) untouched.
+	// See Config.UserAgent.
+	userAgent string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if _, explicit := req.Header["User-Agent"]; !explicit {
-		req.Header.Set("User-Agent", "artex")
+	reqClone := req.Clone(req.Context())
+	if t.userAgent != "" {
+		reqClone.Header.Set("User-Agent", t.userAgent)
+	} else if _, explicit := reqClone.Header["User-Agent"]; !explicit {
+		reqClone.Header.Set("User-Agent", "artex")
 	}
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what
 	// a session-keyed prompt cache wants. Skipped when no session id is present.
 	if t.sessionHeaderKey != "" {
-		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
-			req.Header.Set(t.sessionHeaderKey, sid)
+		if sid := transcript.SessionIDFrom(reqClone.Context()); sid != "" {
+			reqClone.Header.Set(t.sessionHeaderKey, sid)
 		}
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
 	// them: norma builds the request body internally and decodes the SSE response
 	// before either reaches the recorder.
-	capt := llmrec.CaptureFrom(req.Context())
-	capt.SetRequest(requestBodySnapshot(req))
+	capt := llmrec.CaptureFrom(reqClone.Context())
+	capt.SetRequest(requestBodySnapshot(reqClone))
 
-	resp, err := t.base.RoundTrip(req)
+	resp, err := t.base.RoundTrip(reqClone)
 	if err != nil || resp == nil {
 		return resp, err
 	}
@@ -431,6 +443,10 @@ func requestBodySnapshot(req *http.Request) string {
 }
 
 func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+	return quotaAwareHTTPClientWithUserAgent(proxy, sessionHeaderKey, "")
+}
+
+func quotaAwareHTTPClientWithUserAgent(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -449,7 +465,35 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{
+		base:             transport,
+		sessionHeaderKey: strings.TrimSpace(sessionHeaderKey),
+		userAgent:        strings.TrimSpace(userAgent),
+	}}, nil
+}
+
+// MaxUserAgentLen bounds a custom User-Agent value. Generous for real UA strings
+// while keeping a pathological value out of every outbound request.
+const MaxUserAgentLen = 256
+
+// ValidateUserAgent trims a custom User-Agent and returns the cleaned value. An
+// empty/blank input is valid and means "no override" (keep the default UA). A
+// non-empty value is rejected when it exceeds MaxUserAgentLen or contains any
+// control character (including CR/LF, which would allow header injection).
+func ValidateUserAgent(raw string) (string, error) {
+	ua := strings.TrimSpace(raw)
+	if ua == "" {
+		return "", nil
+	}
+	if len(ua) > MaxUserAgentLen {
+		return "", fmt.Errorf("user agent too long: %d bytes (max %d)", len(ua), MaxUserAgentLen)
+	}
+	for _, r := range ua {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("user agent contains a control character")
+		}
+	}
+	return ua, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a

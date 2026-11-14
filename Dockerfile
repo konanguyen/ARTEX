@@ -65,10 +65,10 @@ COPY --from=gobuild /out/artex /app/artex
 # 它同时负责把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1，
 # 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
 COPY start.sh /app/start.sh
-RUN chmod +x /app/artex /app/start.sh
+RUN chmod +x /app/artex /app/start.sh && mkdir -p /app/keys
 COPY skills/ /app/skills/
-# data/（SQLite + jwt.key）持久化点
-VOLUME ["/app/data"]
+# persistence points: data/ (SQLite, task files) and keys/ (jwt.key, secret.key via ARTEX_JWT_KEY_DIR)
+VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
 ENTRYPOINT ["/app/start.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

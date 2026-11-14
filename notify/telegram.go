@@ -105,6 +105,7 @@ func telegramEndpoint(cfg map[string]any) (string, error) {
 
 // telegramHTML 渲染 HTML 正文，返回正文与实际写入的条目数（见 Channel.Send）。
 func telegramHTML(m Message) (string, int) {
+	lim := m.limits()
 	var b strings.Builder
 	b.WriteString("<b>" + telegramEscape(markdownTitle(m)) + "</b>\n")
 	if m.Batch {
@@ -114,13 +115,13 @@ func telegramHTML(m Message) (string, int) {
 			footer = fmt.Sprintf("\n\n<a href=\"%s\">View All on Platform</a>", telegramEscapeAttr(m.HomeURL))
 		}
 		kept := packItemCount(m.Items, telegramTextLimit, telegramReservedRunes, footer, runeSize, func(it Item, idx int) string {
-			return telegramBatchLine(it, idx+1)
+			return telegramBatchLine(it, idx+1, lim)
 		})
 		items := m.Items[:kept]
 		b.Reset()
 		b.WriteString("<b>" + telegramEscape(telegramBatchTitle(m, items, len(m.Items))) + "</b>")
 		for i, it := range items {
-			b.WriteString("\n" + telegramEscape(telegramBatchLine(it, i+1)))
+			b.WriteString("\n" + telegramEscape(telegramBatchLine(it, i+1, lim)))
 		}
 		b.WriteString(footer)
 		return TruncateHTML(b.String(), telegramTextLimit), kept
@@ -136,10 +137,10 @@ func telegramHTML(m Message) (string, int) {
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
 		b.WriteString("\n<b>Type</b>: " + telegramEscape(it.VulnClass))
 	}
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		b.WriteString("\n<b>Asset</b>: " + telegramEscape(a))
 	}
-	if s := OneLine(it.Summary, maxSummaryRunes); s != "" {
+	if s := OneLine(it.Summary, lim.SummaryRunes); s != "" {
 		b.WriteString("\n<b>Summary</b>: " + telegramEscape(s))
 	}
 	if it.DetailURL != "" {
@@ -152,8 +153,8 @@ func telegramHTML(m Message) (string, int) {
 const telegramReservedRunes = 160
 
 // telegramBatchLine 渲染汇总里的一条（未转义，由调用方统一转义）。
-func telegramBatchLine(it Item, idx int) string {
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+func telegramBatchLine(it Item, idx int, lim Limits) string {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		return fmt.Sprintf("%d. %s · %s — %s", idx, SeverityLabel(it.Severity), it.Title(), a)
 	}
 	return fmt.Sprintf("%d. %s · %s", idx, SeverityLabel(it.Severity), it.Title())

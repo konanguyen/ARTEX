@@ -263,6 +263,30 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 	return err
 }
 
+// ProveGoal atomically records the proof edge and marks this exploration's goal met.
+func (s *ExplorationStore) ProveGoal(goalID, evidenceID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
+ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, evidenceID, RelProves, goalID); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes SET state='met', blocked_reason=NULL, content_version=content_version+1 WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("goal not found")
+	}
+	return tx.Commit()
+}
+
 // SetNodeState updates any node's state (never deletes). content_version bumps
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {

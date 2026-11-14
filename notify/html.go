@@ -37,10 +37,10 @@ func htmlBody(m Message, maxRunes int) string {
 	if m.Batch {
 		b.WriteString(htmlBatchIntro(m))
 		for _, it := range m.Items {
-			b.WriteString(htmlItem(it, false))
+			b.WriteString(htmlItem(it, false, m.limits()))
 		}
 	} else if len(m.Items) > 0 {
-		b.WriteString(htmlItem(m.Items[0], true))
+		b.WriteString(htmlItem(m.Items[0], true, m.limits()))
 	}
 	if m.HomeURL != "" {
 		fmt.Fprintf(&b, `<p style="margin:16px 0 0;"><a href="%s" style="color:#1677ff;">View All on Platform</a></p>`, htmlEscapeAttr(m.HomeURL))
@@ -76,7 +76,7 @@ func htmlBatchIntro(m Message) string {
 
 // htmlItem 渲染单个漏洞。full=true 时含摘要与回链（单条推送），
 // false 时压缩成一行（汇总列表）。
-func htmlItem(it Item, full bool) string {
+func htmlItem(it Item, full bool, lim Limits) string {
 	color := htmlSeverityColor(it.Severity)
 	var b strings.Builder
 	if full {
@@ -89,7 +89,7 @@ func htmlItem(it Item, full bool) string {
 
 	if !full {
 		var extras []string
-		if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+		if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 			extras = append(extras, htmlEscape(a))
 		}
 		if it.Summary != "" {
@@ -109,10 +109,10 @@ func htmlItem(it Item, full bool) string {
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
 		fmt.Fprintf(&b, `<div><b>Type</b>: %s</div>`, htmlEscape(it.VulnClass))
 	}
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		fmt.Fprintf(&b, `<div><b>Asset</b>: %s</div>`, htmlEscape(a))
 	}
-	if s := OneLine(it.Summary, maxSummaryRunes); s != "" {
+	if s := OneLine(it.Summary, lim.SummaryRunes); s != "" {
 		fmt.Fprintf(&b, `<div><b>Summary</b>: %s</div>`, htmlEscape(s))
 	}
 	if it.DetailURL != "" {

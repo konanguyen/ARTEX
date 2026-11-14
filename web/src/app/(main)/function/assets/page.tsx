@@ -6,6 +6,7 @@ import {
   BuildingIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   GlobeIcon,
   KeyRoundIcon,
   LayoutTemplateIcon,
@@ -59,7 +60,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { parseCompanyScopeText } from "@/lib/company-scope";
+import { companyScopeRuleText, parseCompanyScopeText } from "@/lib/company-scope";
 import { useI18n } from "@/lib/i18n";
 import type { Asset, Company, CompanyScopeRule } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -205,6 +206,29 @@ export default function AssetsPage() {
     }
   };
 
+  const [exportingFormat, setExportingFormat] = React.useState<"csv" | "json" | null>(null);
+  const exporting = exportingFormat !== null;
+  const doExport = async (format: "csv" | "json") => {
+    setExportingFormat(format);
+    try {
+      if (selected.size > 0) {
+        await api.exportAssets({ format, scope: "selected", ids: Array.from(selected) });
+      } else {
+        const dsl = query.trim();
+        await api.exportAssets({
+          format,
+          scope: "filtered",
+          filters: { type: tab !== "company" ? tab : "", dsl },
+        });
+      }
+      toast.success(t("assets.exportSuccess"));
+    } catch (e) {
+      toast.error(t("assets.exportFailed", { message: String((e as Error)?.message ?? e) }));
+    } finally {
+      setExportingFormat(null);
+    }
+  };
+
   const confirmDeleteCompany = async () => {
     if (!companyDeleteTarget) return;
     setCompanyDeleting(true);
@@ -329,6 +353,12 @@ export default function AssetsPage() {
               <Trash2Icon className="size-3.5" /> {t("assets.deleteSelected", { count: selected.size })}
             </Button>
           )}
+          <Button variant="outline" size="sm" onClick={() => doExport("csv")} disabled={exporting || tab === "company"}>
+            <DownloadIcon className="size-3.5" /> {t("assets.exportCsv")}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => doExport("json")} disabled={exporting || tab === "company"}>
+            <DownloadIcon className="size-3.5" /> {t("assets.exportJson")}
+          </Button>
           <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
             <RefreshCwIcon className={cn("size-4", loading && "animate-spin")} /> {t("action.refresh")}
           </Button>
@@ -968,9 +998,7 @@ function savedScopeRules(company: Company): CompanyScopeRule[] {
 }
 
 function savedScopeText(company: Company): string {
-  return savedScopeRules(company)
-    .map((scope) => scope.value)
-    .join("\n");
+  return savedScopeRules(company).map(companyScopeRuleText).join("\n");
 }
 
 // 新增企业使用与任务、LLM 编辑一致的右侧抽屉。
@@ -1061,7 +1089,10 @@ function EditScopeDialog({ company, onSaved }: { company: Company; onSaved: () =
   const [scopeText, setScopeText] = React.useState("");
   const [reason, setReason] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const preservedScopeRules = React.useMemo(() => savedScopeRules(company), [company]);
+  const preservedScopeRules = React.useMemo(
+    () => savedScopeRules(company).filter((rule) => rule.kind !== "host"),
+    [company],
+  );
   const parsedScope = React.useMemo(
     () => parseCompanyScopeText(scopeText, { preservedRules: preservedScopeRules }),
     [preservedScopeRules, scopeText],

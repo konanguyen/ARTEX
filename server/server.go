@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -44,7 +45,15 @@ type Server struct {
 	ctx    context.Context
 
 	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
+
+	scrubSecrets bool // drop startup secret env vars (ARTEX_PG_DSN, ARTEX_SECRET_KEY, API keys) once read (binary only)
+
+	setupMu    sync.Mutex
+	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
+
+	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
+	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -140,7 +149,7 @@ type triggeredRun struct {
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
 }
 
-func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
@@ -150,7 +159,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
+		loginLimit: newLoginLimiter(time.Now)}
+	for _, o := range opts {
+		o(s)
+	}
+	s.initSetupToken()
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -231,9 +245,6 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
-		// Fill the tool cache for any enabled MCP that has none yet (notably the
-		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -251,6 +262,18 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
+	}
+	// Both env readers have now run (NewManager for the DSN/secret key, FromEnv above
+	// for the API keys). Drop the secrets before anything below can spawn a child
+	// process: restoring runtimes resumes workers that run shells, and MCP discovery
+	// starts stdio servers.
+	if s.scrubSecrets {
+		ScrubSecretEnv()
+	}
+	if m.pg != nil {
+		// Fill the tool cache for any enabled MCP that has none yet (notably the
+		// seeded browser MCP on first run). Async so it never blocks startup.
+		go s.discoverEmptyMCPsOnStartup()
 	}
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
@@ -333,6 +356,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -358,6 +382,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	sessionHeaderKey := cfg.SessionHeaderKey
+	var userAgent string
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -367,6 +392,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				if sessionHeaderKey == "" {
 					sessionHeaderKey = p.SessionHeaderKey
 				}
+				userAgent = p.UserAgent
 				retry = p.Retry
 				break
 			}
@@ -377,7 +403,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
-		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
+		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
 		Retry: retry,
 	})
 	if err != nil {
@@ -448,6 +474,8 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
 		prov = bindSideProvider(prov, cfg, 0, profName)
+		// Per-profile in-flight cap (llm_max_concurrent); no-op when unset.
+		prov = newConcurrencyProvider(prov, s.m)
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
@@ -506,6 +534,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -583,6 +612,8 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
 		prov = bindSideProvider(prov, cfg, id, p.Name)
 	}
+	// Per-profile in-flight cap (llm_max_concurrent); no-op when unset.
+	prov = newConcurrencyProvider(prov, s.m)
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
@@ -743,6 +774,7 @@ func (s *Server) Handler() http.Handler {
 	// asset system
 	mux.HandleFunc("GET /api/assets", s.listAssets)
 	mux.HandleFunc("GET /api/assets/counts", s.assetCounts)
+	mux.HandleFunc("GET /api/assets/export", s.assetsExport)
 	mux.HandleFunc("POST /api/assets", s.insertAssets)
 	mux.HandleFunc("DELETE /api/assets", s.deleteAssets)
 
@@ -792,6 +824,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
+	mux.HandleFunc("POST /api/traffic/ingest", s.ingestTraffic)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
@@ -924,6 +957,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
 	mux.HandleFunc("POST /api/intercept/pending/{id}/decide", s.interceptDecide)
+	mux.HandleFunc("POST /api/intercept/pending/{id}/always-allow", s.interceptAlwaysAllow) // creates an argv allow rule; the request stays pending
 	mux.HandleFunc("GET /api/intercept/history", s.interceptHistory)
 	mux.HandleFunc("GET /api/intercept/history/{id}", s.interceptDetail)
 	mux.HandleFunc("GET /api/intercept/history/{id}/execution", s.interceptExecution)
@@ -946,7 +980,14 @@ func (s *Server) Handler() http.Handler {
 
 // --- handlers ---
 
+// health answers without a token (requireAuth exempts it), but only a caller
+// with a valid token gets the service name and version; the web UI's top bar
+// reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	if !verifyJWT(extractToken(r), s.jwtKey) {
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
 }
 
@@ -1305,7 +1346,8 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 		"provider":         s.llmCfg.Provider(),
 		"model":            s.llmCfg.Model,
 		"base_url":         s.llmCfg.BaseURL,
-		"proxy":            s.llmCfg.Proxy,
+		"proxy":            maskedSecret(s.llmCfg.Proxy),
+		"proxy_set":        s.llmCfg.Proxy != "",
 		"key_set":          s.llmCfg.APIKey != "",
 		"rate_per_second":  s.llmCfg.RatePerSecond,
 		"rate_per_minute":  s.llmCfg.RatePerMinute,
@@ -1332,6 +1374,11 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if isMaskedSecret(req.Proxy) { // getLLM returns the proxy masked: keep the current one
+		s.cfgMu.Lock()
+		req.Proxy = s.llmCfg.Proxy
+		s.cfgMu.Unlock()
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
@@ -1387,10 +1434,27 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		UserAgent        string `json:"user_agent"`         // non-empty = override User-Agent during connection test (mirrors production)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	var stored *db.LLMProfile
+	if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
+		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			stored = p
+		}
+	}
+	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: test with the stored one
+		req.Proxy = ""
+		if stored != nil {
+			req.Proxy = stored.Proxy
+		} else {
+			s.cfgMu.Lock()
+			req.Proxy = s.llmCfg.Proxy
+			s.cfgMu.Unlock()
+		}
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
@@ -1407,19 +1471,27 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	providerSessionHeaderKey := cfg.SessionHeaderKey
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	cfg.UserAgent = strings.TrimSpace(req.UserAgent)
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
-	// 会话头名同理：表单未带时用已存 profile 的值兜底，再回落到 provider 默认值。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
-				cfg.APIKey = p.APIKey
-			}
-			if cfg.SessionHeaderKey == "" {
-				cfg.SessionHeaderKey = p.SessionHeaderKey
-			}
+	// 会话头名与自定义 UA 同理：表单未带时用已存 profile 的值兜底，再回落到 provider 默认值。
+	if stored != nil {
+		if cfg.APIKey == "" {
+			cfg.APIKey = stored.APIKey
+		}
+		if cfg.SessionHeaderKey == "" {
+			cfg.SessionHeaderKey = stored.SessionHeaderKey
+		}
+		if cfg.UserAgent == "" {
+			cfg.UserAgent = strings.TrimSpace(stored.UserAgent)
 		}
 	}
+	ua, err := agent.ValidateUserAgent(cfg.UserAgent)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	cfg.UserAgent = ua
 	// Request and saved-profile headers take precedence over provider defaults.
 	if cfg.SessionHeaderKey == "" {
 		cfg.SessionHeaderKey = providerSessionHeaderKey
@@ -3311,6 +3383,7 @@ func (s *Server) settingsPayload() map[string]any {
 	if concLimit == 0 {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
+	limits := notifyLimits(s.m.pg)
 	return map[string]any{
 		"traffic_capture":          s.m.TrafficEnabled(),
 		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
@@ -3319,12 +3392,17 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":       backend,
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"web_search_proxy":         maskedSecret(proxy), // proxies may carry user:pass: masked when set, "" = direct
+		"web_search_proxy_set":     proxy != "",
+		"global_proxy":             maskedSecret(s.m.GlobalProxy()), // global egress proxy, masked when set, "" = direct
+		"global_proxy_set":         s.m.GlobalProxy() != "",
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		// Per-profile in-flight LLM request cap; 0 = unlimited. Each profile's
+		// provider gets its own semaphore, shared across its agents.
+		"llm_max_concurrent":       s.m.LLMMaxConcurrent(),
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3336,10 +3414,13 @@ func (s *Server) settingsPayload() map[string]any {
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
-		// 这里只放「作用于全部渠道」的三项。
+		// 这里只放「作用于全部渠道」的全局项。
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		// Render limits of IM messages; 0 = no truncation.
+		"notify_summary_max_runes": limits.SummaryRunes,
+		"notify_assets_max_shown":  limits.AssetsShown,
 	}
 }
 
@@ -3398,6 +3479,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
+		// LLMMaxConcurrent caps simultaneous in-flight LLM requests per profile
+		// (0 = unlimited). Changing it rebuilds providers so the new cap takes hold.
+		LLMMaxConcurrent *int `json:"llm_max_concurrent"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -3407,16 +3491,21 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
 		// 实验功能:noa 上下文压缩开关(默认关);每 run 读,对之后启动的 run 生效,无需重建 agent。
 		NoaCompaction *bool `json:"noa_compaction"`
-		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
-		// 不需要重建 agent 或重启。
+		// 漏洞 IM 推送的全局项。改完由投递引擎每轮重读，即时生效、无需重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// Render limits of IM messages: summary characters (0-4000) and asset names listed (0-50); 0 = no truncation.
+		NotifySummaryMaxRunes *int `json:"notify_summary_max_runes"`
+		NotifyAssetsMaxShown  *int `json:"notify_assets_max_shown"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// A masked placeholder echoed back keeps the stored secret, like null.
+	req.BraveKey, req.TavilyKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey)
+	req.WebSearchProxy, req.GlobalProxy = keepIfMasked(req.WebSearchProxy), keepIfMasked(req.GlobalProxy)
 	if req.ConstraintsInjectPlanner != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {
 			writeErr(w, 500, err.Error())
@@ -3467,6 +3556,26 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.NotifySummaryMaxRunes != nil {
+		if *req.NotifySummaryMaxRunes < 0 || *req.NotifySummaryMaxRunes > notifySummaryMaxRunesCap {
+			writeErr(w, 400, fmt.Sprintf("Summary limit must be between 0 and %d characters (0 = no truncation)", notifySummaryMaxRunesCap))
+			return
+		}
+		if err := s.m.pg.SetSetting(settingNotifySummaryMaxRunes, strconv.Itoa(*req.NotifySummaryMaxRunes)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.NotifyAssetsMaxShown != nil {
+		if *req.NotifyAssetsMaxShown < 0 || *req.NotifyAssetsMaxShown > notifyAssetsMaxShownCap {
+			writeErr(w, 400, fmt.Sprintf("Asset limit must be between 0 and %d (0 = no truncation)", notifyAssetsMaxShownCap))
+			return
+		}
+		if err := s.m.pg.SetSetting(settingNotifyAssetsMaxShown, strconv.Itoa(*req.NotifyAssetsMaxShown)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
 	if req.Workers != nil {
 		if err := s.m.SetWorkers(*req.Workers); err != nil {
 			writeErr(w, 400, err.Error())
@@ -3507,6 +3616,16 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	changed := false
+	if req.LLMMaxConcurrent != nil {
+		if err := s.m.SetLLMMaxConcurrent(*req.LLMMaxConcurrent); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		// Providers embed the semaphore at build time: drop the per-profile caches and
+		// mark changed so applyLLM also rebuilds the global provider (llmProv/llmDirect).
+		s.invalidateProfileAgents()
+		changed = true
+	}
 	if req.LLMPoolEnabled != nil {
 		if err := s.m.SetLLMPoolEnabled(*req.LLMPoolEnabled); err != nil {
 			writeErr(w, 500, err.Error())
@@ -3594,13 +3713,17 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	_, backend, storedBraveKey, storedTavilyKey, _ := s.m.WebSearch()
+	_, backend, storedBraveKey, storedTavilyKey, storedProxy := s.m.WebSearch()
 	if strings.TrimSpace(req.Backend) != "" {
 		backend = req.Backend
 	}
 	// Proxy is taken from the form as-is (empty = direct), so testing reflects exactly
 	// what's shown — including an intentional "clear proxy to test direct" before saving.
+	// The masked placeholder the form shows for a saved proxy means the saved one.
 	proxy := strings.TrimSpace(req.Proxy)
+	if isMaskedSecret(proxy) {
+		proxy = storedProxy
+	}
 	// API keys are secrets the form omits when already saved, so fall back to stored.
 	braveKey := storedBraveKey
 	if strings.TrimSpace(req.BraveKey) != "" {

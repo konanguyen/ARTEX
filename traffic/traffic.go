@@ -454,58 +454,9 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
 	respB := t.spill(f.Response.Body, ct)
 
-	tx, err := t.db.Begin()
-	if err != nil {
-		log.Printf("[traffic] record %s failed (begin transaction): %v", url, err)
-		return
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op once committed
-
-	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
-	// row whose bodies still live in the old on-disk tree (see Get).
-	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
-VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
-		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
-	if err != nil {
-		log.Printf("[traffic] record %s failed (write index): %v", url, err)
-		return
-	}
-	rowid, err := res.LastInsertId()
-	if err != nil {
-		log.Printf("[traffic] record %s failed (get rowid): %v", url, err)
-		return
-	}
-
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO exchange_bodies(id,req_head,req_body,req_blob,resp_head,resp_body,resp_blob)
-VALUES(?,?,?,?,?,?,?)`,
-		id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
-		log.Printf("[traffic] record %s failed (write body): %v", url, err)
-		return
-	}
-
-	for _, h := range []string{reqB.hash, respB.hash} {
-		if h == "" {
-			continue
-		}
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, id); err != nil {
-			log.Printf("[traffic] record %s failed (register blob ref): %v", url, err)
-			return
-		}
-	}
-
-	if t.fts {
-		// The index is fed from memory, so a body that spilled to _blobs is still
-		// fully searchable even though only its preview is stored inline.
-		idx := strings.Join([]string{url, reqHead, reqB.index, respHead, respB.index}, "\n")
-		if _, err := tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, idx); err != nil {
-			log.Printf("[traffic] record %s failed (write fts): %v", url, err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("[traffic] record %s failed (commit): %v", url, err)
+	if err := t.insertExchange(id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
+		len(f.Request.Body), len(f.Response.Body), reqHead, reqB, respHead, respB); err != nil {
+		log.Printf("[traffic] record %s failed (%v)", url, err)
 	}
 }
 

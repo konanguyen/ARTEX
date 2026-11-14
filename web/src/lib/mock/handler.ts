@@ -784,7 +784,7 @@ function mockScopeRows(
     }
     const normalized = normalizeCompanyScopeValue(rule);
     const row: ScopeRow = { id: nextID++, company_id: companyID, kind: rule.kind, raw: rule.value.trim() };
-    if (rule.kind === "domain") row.domain = normalized;
+    if (rule.kind === "domain" || rule.kind === "host") row.domain = normalized;
     else if (rule.kind === "ip") row.net = `${normalized}/${normalized.includes(":") ? 128 : 32}`;
     else if (rule.kind === "cidr") row.net = normalized;
     else row.value = normalized;
@@ -1684,11 +1684,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
         const scope: TaskScopeRow = {
           id: Date.now() + currentScopes.length,
           task_id: numericTaskID,
-          kind: rule.kind === "domain" ? "root_domain" : rule.kind,
+          // A host rule is exactly one hostname, the task scope `subdomain` kind.
+          kind: rule.kind === "domain" ? "root_domain" : rule.kind === "host" ? "subdomain" : rule.kind,
           source: "manual",
           reason: "用户在测试资产页手工新增",
         };
-        if (rule.kind === "domain") scope.domain = normalized;
+        if (rule.kind === "domain" || rule.kind === "host") scope.domain = normalized;
         else if (rule.kind === "ip") scope.net = `${normalized}/${normalized.includes(":") ? 128 : 32}`;
         else if (rule.kind === "cidr") scope.net = normalized;
         else scope.value = normalized;
@@ -2409,6 +2410,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (row?.status !== "pending") throw new Error("审批已处理或不存在，请刷新记录");
     if (b.decision !== "allowed" && b.decision !== "denied") throw new Error("无效审批动作");
     row.status = b.decision;
+    row.decided_by = "human";
     row.decided_at = new Date().toISOString();
     const detail = mockInterceptDetails[id];
     if (detail) {
@@ -2429,20 +2431,24 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/history" || (seg[0] === "intercept" && seg[1] === "task")) {
     let status = q.get("status") || "";
     let decisionSource = q.get("decision_source") || "";
+    let decidedBy = q.get("decided_by") || "";
     if (status === "all") status = "";
     if (decisionSource === "all") decisionSource = "";
+    if (decidedBy === "all") decidedBy = "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
     if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    if (decidedBy && !["human", "rule", "model", "system"].includes(decidedBy)) throw new Error("无效决定方");
     const filtered = mockInterceptHistory.filter((row) => {
       const source =
         row.decision_source || (row.rule_id ? "rule" : row.reason?.toLowerCase().startsWith("[model]") || row.reason?.startsWith("[模型]") ? "model" : "unknown");
       return (
         (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
         (!status || row.status === status) &&
-        (!decisionSource || source === decisionSource)
+        (!decisionSource || source === decisionSource) &&
+        (!decidedBy || row.decided_by === decidedBy)
       );
     });
-    if (!q.has("page") && !q.has("size") && !status && !decisionSource)
+    if (!q.has("page") && !q.has("size") && !status && !decisionSource && !decidedBy)
       return { items: filtered, total: filtered.length };
     const page = Math.max(1, Number(q.get("page")) || 1);
     const size = Math.min(100, Math.max(1, Number(q.get("size")) || 20));
@@ -2458,10 +2464,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/judge" && m === "GET")
     return {
       enabled: false,
+      mode: "closed",
       profile_id: 0,
       prompt: "",
       timeout_seconds: 15,
-      fail_action: "allow",
+      fail_action: "ask",
       ask_timeout_seconds: 300,
       ask_timeout_action: "deny",
     };

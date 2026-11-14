@@ -14,7 +14,7 @@
 #
 # 用法示例：
 #   ./reset-password.sh                          # 本地，自动读 config.json/环境，交互输入新密码
-#   ./reset-password.sh -p 'NewPass!'            # 本地，直接给定新密码
+#   ./reset-password.sh -p 'New-Passphrase!'     # 本地，直接给定新密码（至少 12 位）
 #   ./reset-password.sh --dsn postgres://u:p@h:5432/artex
 #   ./reset-password.sh -H 127.0.0.1 -P 5433 -U autopentest -W pass -d artex
 #   ./reset-password.sh -m docker                # docker 部署（读 .env 的 POSTGRES_*）
@@ -95,7 +95,7 @@ PY
 }
 
 apply_config_fields() {
-  local line key val
+  local key val
   while IFS=$'\t' read -r key val; do
     [[ -z "$key" ]] && continue
     case "$key" in
@@ -130,6 +130,10 @@ if [[ -z "$NEWPASS" ]]; then
   [[ "$NEWPASS" == "$NEWPASS2" ]] || die "两次输入不一致"
 fi
 [[ -n "$NEWPASS" ]] || die "密码不能为空"
+# Same minimum as the server (minPasswordRunes in server/auth.go), counted in
+# characters like the server: UTF-8 bytes minus continuation bytes, whatever the locale.
+NEWPASS_CHARS=$(printf '%s' "$NEWPASS" | LC_ALL=C tr -d '\200-\277' | wc -c)
+(( NEWPASS_CHARS >= 12 )) || die "密码长度至少 12 位"
 
 # 通过环境变量把密码交给 psql（\getenv 读取，不进入 argv/ps）
 export ARTEX_RESET_NEWPASS="$NEWPASS"

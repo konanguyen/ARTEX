@@ -16,6 +16,7 @@ export default function SetupPage() {
   const { t } = useI18n();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [setupToken, setSetupToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -38,18 +39,22 @@ export default function SetupPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!setupToken.trim()) {
+      setError(t("auth.setup.setupTokenRequired"));
+      return;
+    }
     if (password !== confirm) {
       setError(t("auth.setup.passwordMismatch"));
       return;
     }
-    if (password.length < 8) {
+    if (password.length < 12) {
       setError(t("auth.setup.passwordTooShort"));
       return;
     }
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -95,6 +100,17 @@ export default function SetupPage() {
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
               <div className="space-y-1.5">
+                <Label htmlFor="setup-token">{t("auth.setup.setupToken")}</Label>
+                <Input
+                  id="setup-token"
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  placeholder={t("auth.setup.setupTokenPlaceholder")}
+                  autoFocus
+                  autoComplete="off"
+                />
+              </div>
+              <div className="space-y-1.5">
                 <Label htmlFor="password">{t("auth.setup.newPassword")}</Label>
                 <Input
                   id="password"
@@ -102,7 +118,6 @@ export default function SetupPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder={t("auth.setup.passwordPlaceholder")}
-                  autoFocus
                   autoComplete="new-password"
                 />
               </div>
@@ -118,7 +133,11 @@ export default function SetupPage() {
                 />
               </div>
               {error && <p className="text-sm text-destructive">{error}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !setupToken.trim() || !password || !confirm}
+              >
                 {loading ? t("auth.setup.saving") : t("auth.setup.submit")}
               </Button>
             </form>

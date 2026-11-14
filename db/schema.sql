@@ -115,17 +115,20 @@ CREATE TRIGGER trg_av2_upd BEFORE UPDATE ON assets
 CREATE TABLE IF NOT EXISTS company_scope (
     id         BIGSERIAL PRIMARY KEY,
     company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    kind       TEXT NOT NULL CHECK (kind IN ('domain','ip','cidr','icp','keyword')),
+    kind       TEXT NOT NULL CHECK (kind IN ('domain','host','ip','cidr','icp','keyword')),
     domain     TEXT,
     net        CIDR,
     value      TEXT,
     raw        TEXT NOT NULL,
     reason     TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- A `host` entry shares the domain column with `domain`, so a host entry
+    -- whose value equals an existing domain entry of the same company is a
+    -- skipped duplicate: the domain entry already covers that name.
     CONSTRAINT uq_sv2_domain UNIQUE (company_id, domain),
     CONSTRAINT uq_sv2_net    UNIQUE (company_id, net),
     CONSTRAINT ck_company_scope_payload CHECK (
-        (kind = 'domain' AND domain IS NOT NULL AND net IS NULL AND value IS NULL)
+        (kind IN ('domain','host') AND domain IS NOT NULL AND net IS NULL AND value IS NULL)
         OR (kind IN ('ip','cidr') AND domain IS NULL AND net IS NOT NULL AND value IS NULL)
         OR (kind IN ('icp','keyword') AND domain IS NULL AND net IS NULL AND value IS NOT NULL)
     )
@@ -134,14 +137,15 @@ CREATE TABLE IF NOT EXISTS company_scope (
 ALTER TABLE company_scope ADD COLUMN IF NOT EXISTS value TEXT;
 ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS company_scope_kind_check;
 ALTER TABLE company_scope ADD CONSTRAINT company_scope_kind_check
-    CHECK (kind IN ('domain','ip','cidr','icp','keyword'));
+    CHECK (kind IN ('domain','host','ip','cidr','icp','keyword'));
 ALTER TABLE company_scope DROP CONSTRAINT IF EXISTS ck_company_scope_payload;
 ALTER TABLE company_scope ADD CONSTRAINT ck_company_scope_payload CHECK (
-    (kind = 'domain' AND domain IS NOT NULL AND net IS NULL AND value IS NULL)
+    (kind IN ('domain','host') AND domain IS NOT NULL AND net IS NULL AND value IS NULL)
     OR (kind IN ('ip','cidr') AND domain IS NULL AND net IS NOT NULL AND value IS NULL)
     OR (kind IN ('icp','keyword') AND domain IS NULL AND net IS NULL AND value IS NOT NULL)
 );
-CREATE INDEX IF NOT EXISTS idx_sv2_domain  ON company_scope(domain)   WHERE kind = 'domain';
+DROP INDEX IF EXISTS idx_sv2_domain;
+CREATE INDEX IF NOT EXISTS idx_sv2_domain  ON company_scope(domain)   WHERE kind IN ('domain','host');
 CREATE INDEX IF NOT EXISTS idx_sv2_net     ON company_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sv2_value ON company_scope(company_id, kind, value) WHERE kind IN ('icp','keyword');
 CREATE INDEX IF NOT EXISTS idx_sv2_icp ON company_scope(value) WHERE kind = 'icp';
@@ -395,6 +399,8 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- 自定义会话头：非空时每次请求带一个该名字的 HTTP 头，头值=当前运行的 session id
     -- (chat 会话/worker 意图)。用于某些按 session-id 头做提示缓存/粘性路由的网关。''=不发送。
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- Custom User-Agent: when non-empty, every outbound LLM request overrides the User-Agent header with this value. ''=do not override (keep the default UA).
+    user_agent         TEXT NOT NULL DEFAULT '',
     -- 重试覆盖：次数 0=用全局默认/-1=关闭/>0=该值；间隔 0=用默认指数退避/>0=固定毫秒。
     -- 三组分别对应建连重试、空响应重试、同 provider 安全窗口重试，详见下方 ALTER 处注释。
     retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
@@ -434,6 +440,8 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- 自定义会话头名；补旧库。默认 '' = 不发送，旧配置行为不变。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- Custom User-Agent; backfills old databases. Default '' = do not override (keep the default UA); old configs behave unchanged.
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT '';
 
 -- 单配置的重试覆盖（见 docs/LLM重试设计.md）。三组各自一对「次数 + 固定间隔」，
 -- 语义统一：次数 0=沿用全局默认、-1=关闭该层重试、>0=用该值；间隔 0=沿用该层的
@@ -1040,7 +1048,7 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     enabled         BOOLEAN NOT NULL DEFAULT true,
     priority        INTEGER NOT NULL DEFAULT 0,
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
-    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex')),
+    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex', 'argv')),
     pattern         TEXT NOT NULL,
     action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask')),
     message         TEXT NOT NULL DEFAULT '',
@@ -1050,6 +1058,10 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Allow argv prefix rules on databases created before them (pattern = JSON array of tokens).
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_match_type_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_match_type_check
+    CHECK (match_type IN ('string','regex','argv'));
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1084,6 +1096,10 @@ UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 
 UPDATE intercept_pending SET decision_source='model'
  WHERE decision_source='unknown' AND rule_id IS NULL
    AND (lower(reason) LIKE '[model]%' OR reason LIKE '[模型]%');
+-- Actor that settled the request: '' (pending, or decided before this column
+-- existed) | human | rule | model | system. No backfill: readers fall back to
+-- decision_source for legacy rows instead of rewriting history.
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
 
 -- =====================================================================
 -- L. 漏洞发现持久化
@@ -1316,7 +1332,7 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     -- dingtalk 钉钉 / feishu 飞书 / wecom 企业微信 / webhook 通用 / telegram / email
     kind         TEXT NOT NULL,
     enabled      BOOLEAN NOT NULL DEFAULT true,
-    -- 凭据(明文存储，UI 掩码回显；见 server 侧 maskChannelSecrets)。六种渠道字段差异极大，
+    -- Credentials (encrypted at rest by db/secrets.go; masked when echoed to the UI). Six channel kinds differ widely in fields,
     -- 统一 JSONB + Go 侧按 kind 严格校验，避免为每渠道加一堆 NULL 列：
     --   dingtalk {webhook,secret}
     --   feishu   {webhook,secret}

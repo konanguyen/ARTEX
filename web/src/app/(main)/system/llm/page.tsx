@@ -346,6 +346,7 @@ function ProfileSheet({
   const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
+  const [userAgent, setUserAgent] = React.useState(""); // 自定义 User-Agent;空=保持默认 UA
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -375,6 +376,7 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setUserAgent(profile?.user_agent ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -438,6 +440,7 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        userAgent.trim(),
       );
       // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
       if (r.ok)
@@ -481,6 +484,7 @@ function ProfileSheet({
         // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        user_agent: userAgent.trim(),
         retry,
       });
       if (isNew) toast.success(t("llm.save.created", { name: name.trim() }));
@@ -646,6 +650,20 @@ function ProfileSheet({
             />
             <p className="text-muted-foreground text-xs">
               {t("llm.field.sessionHeaderHint")}
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-user-agent">{t("llm.userAgentLabel")}</Label>
+            <Input
+              id="p-user-agent"
+              className="font-mono"
+              placeholder={t("llm.userAgentPlaceholder")}
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              {t("llm.userAgentHint")}
             </p>
           </div>
 

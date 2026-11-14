@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,12 @@ const (
 	settingNotifyPublicBaseURL = "notify_public_base_url"
 	// settingNotifyDigestMinutes 是汇总模式的周期（分钟）。
 	settingNotifyDigestMinutes = "notify_digest_interval_min"
+	// settingNotifySummaryMaxRunes is how many characters the summary of a single
+	// push is cut to, and settingNotifyAssetsMaxShown how many asset names a
+	// message lists. 0 means no truncation; unset means the notify package
+	// defaults (120 / 3).
+	settingNotifySummaryMaxRunes = "notify_summary_max_runes"
+	settingNotifyAssetsMaxShown  = "notify_assets_max_shown"
 )
 
 const (
@@ -38,6 +46,10 @@ const (
 	notifyFanOutPerTick = 200
 	// notifyDefaultDigestMinutes 是汇总周期的默认值。
 	notifyDefaultDigestMinutes = 30
+	// notifySummaryMaxRunesCap / notifyAssetsMaxShownCap are the upper bounds the
+	// settings API accepts for the two render limits.
+	notifySummaryMaxRunesCap = 4000
+	notifyAssetsMaxShownCap  = 50
 	// notifyUnlimitedBurstPerTick 是渠道未设限流时的每轮投递上限。
 	// 存在的意义是防止「一个渠道配成不限流 + 一次扫出上千条漏洞」把
 	// 单轮循环拖成长时间阻塞。
@@ -195,8 +207,9 @@ func (n *Notifier) stepRealtime(ctx context.Context, ch *db.NotificationChannel,
 		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), fmt.Sprintf("channel type %q not registered", ch.Kind))
 		return
 	}
+	limits := notifyLimits(n.pg)
 	for _, dl := range deliveries {
-		msg, err := n.renderSingle(ctx, dl, baseURL)
+		msg, err := n.renderSingle(ctx, dl, baseURL, limits)
 		if err != nil {
 			// 渲染失败是本地数据问题，重试不会变好。
 			_ = n.pg.FailDeliveries(ctx, []int64{dl.ID}, err.Error())
@@ -230,7 +243,7 @@ func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, a
 		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), fmt.Sprintf("channel type %q not registered", ch.Kind))
 		return
 	}
-	msg, included, err := n.renderBatch(ctx, deliveries, baseURL, int(window.Minutes()))
+	msg, included, err := n.renderBatch(ctx, deliveries, baseURL, int(window.Minutes()), notifyLimits(n.pg))
 	if err != nil {
 		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), err.Error())
 		return
@@ -373,7 +386,7 @@ func (n *Notifier) adapt(ch *db.NotificationChannel) (notify.Channel, map[string
 }
 
 // renderSingle 渲染单条漏洞消息。
-func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery, baseURL string) (notify.Message, error) {
+func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery, baseURL string, limits notify.Limits) (notify.Message, error) {
 	snap, err := parseSnapshot(dl)
 	if err != nil {
 		return notify.Message{}, err
@@ -382,7 +395,7 @@ func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery
 	if err != nil {
 		return notify.Message{}, err
 	}
-	return notify.Message{Items: []notify.Item{item}, HomeURL: baseURL}, nil
+	return notify.Message{Items: []notify.Item{item}, HomeURL: baseURL, Limits: &limits}, nil
 }
 
 // renderBatch 渲染汇总消息。逐条解析快照——单条坏了只跳过那一条，
@@ -393,7 +406,7 @@ func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery
 // 标记已送达。若这里跳过了坏快照却不把跳过的投递从 included 里剔除，
 // 下标就会错位——本该失败的坏条目会被标成已送达，而好条目被误判为未送达。
 // 坏掉的那些由调用方显式标记失败，见 stepDigest。
-func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.NotificationDelivery, baseURL string, windowMinutes int) (notify.Message, []*db.NotificationDelivery, error) {
+func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.NotificationDelivery, baseURL string, windowMinutes int, limits notify.Limits) (notify.Message, []*db.NotificationDelivery, error) {
 	items := make([]notify.Item, 0, len(deliveries))
 	included := make([]*db.NotificationDelivery, 0, len(deliveries))
 	for _, dl := range deliveries {
@@ -419,6 +432,7 @@ func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.Notificatio
 		Batch:         true,
 		WindowMinutes: windowMinutes,
 		HomeURL:       baseURL,
+		Limits:        &limits,
 	}, included, nil
 }
 
@@ -514,6 +528,30 @@ func (n *Notifier) digestInterval() time.Duration {
 		return time.Duration(notifyDefaultDigestMinutes) * time.Minute
 	}
 	return time.Duration(m) * time.Minute
+}
+
+// notifyLimits reads the summary/asset render limits from the settings.
+func notifyLimits(pg *db.DB) notify.Limits {
+	summary, sOK, _ := pg.GetSetting(settingNotifySummaryMaxRunes)
+	assets, aOK, _ := pg.GetSetting(settingNotifyAssetsMaxShown)
+	return notify.Limits{
+		SummaryRunes: notifyLimitValue(summary, sOK, notify.DefaultMaxSummaryRunes, notifySummaryMaxRunesCap),
+		AssetsShown:  notifyLimitValue(assets, aOK, notify.DefaultMaxAssetsShown, notifyAssetsMaxShownCap),
+	}
+}
+
+// notifyLimitValue resolves one stored render limit: def when the key is unset,
+// unparseable, or outside [0, max]. 0 is a valid value (no truncation), which is
+// why "unset" is carried by ok and not by the number.
+func notifyLimitValue(v string, ok bool, def, max int) int {
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > max {
+		return def
+	}
+	return n
 }
 
 // parseSnapshot 解析投递对应事件的快照。

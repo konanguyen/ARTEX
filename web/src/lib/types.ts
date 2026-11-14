@@ -364,7 +364,7 @@ export interface TaskScopeRow {
   reason?: string;
 }
 
-export type CompanyScopeKind = "domain" | "ip" | "cidr" | "icp" | "keyword";
+export type CompanyScopeKind = "domain" | "host" | "ip" | "cidr" | "icp" | "keyword";
 
 // 新增企业时提交的结构化资产范围规则。
 export interface CompanyScopeRule {
@@ -928,6 +928,9 @@ export interface Settings {
   global_proxy?: string;
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
   workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  // Per-profile cap on simultaneous in-flight LLM requests; 0 = unlimited.
+  // Each profile's provider gets its own semaphore, shared across its agents.
+  llm_max_concurrent?: number;
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
@@ -947,6 +950,9 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+  // Render limits of IM messages; 0 = no truncation. The backend answers 400 outside the bounds.
+  notify_summary_max_runes?: number; // summary characters per finding, 0-4000, default 120
+  notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
 }
 
 // ---- 漏洞 IM 推送 ----
@@ -1054,6 +1060,8 @@ export interface LLMProfile {
   // 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
   // ""=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
   session_header_key?: string;
+  // Custom User-Agent: when non-empty, every outbound LLM request overrides its User-Agent header with this value. "" = do not override.
+  user_agent?: string;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
 }
@@ -1252,7 +1260,7 @@ export interface Stats {
 // ---- Intercept Rules ----
 export type InterceptAction = "allow" | "deny" | "ask";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
-export type InterceptMatchType = "string" | "regex";
+export type InterceptMatchType = "string" | "regex" | "argv";
 
 export interface InterceptRule {
   id: number;
@@ -1307,6 +1315,9 @@ export interface AssetInterceptRule {
 
 export interface InterceptPending {
   decision_source?: "rule" | "model" | "unknown" | "";
+  // Actor that settled the request, exactly as stored: "" while pending and on
+  // rows decided before the column existed (shown as "Legacy").
+  decided_by?: "human" | "rule" | "model" | "system" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1324,6 +1335,7 @@ export interface InterceptPending {
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
 export interface JudgeConfig {
   enabled: boolean;
+  mode?: "closed" | "freeform"; // closed (default): fixed questions, code decides; freeform: the prompt decides
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时
@@ -1351,6 +1363,7 @@ export interface JudgeUsage {
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
   decision_source?: "rule" | "model" | "unknown";
+  decided_by?: "human" | "rule" | "model" | "system";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1501,6 +1514,7 @@ export interface InterceptAudit {
   rule_name?: string;
   config_digest?: string;
   profile_id?: number;
+  judge_answers?: { id: string; answer: "yes" | "no" | "unknown"; evidence: string }[];
   execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
   output?: string;
   output_truncated?: boolean;
@@ -1508,6 +1522,7 @@ export interface InterceptAudit {
 }
 export interface InterceptDetail extends InterceptApprovalRow {
   audit: InterceptAudit | null;
+  always_allow_prefix?: string; // pending Bash request: the argv prefix "always allow" would allow
 }
 
 export type TrafficEvidenceRole = "baseline" | "proof" | "verification" | "supporting";

@@ -229,6 +229,7 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  if (filter.decided_by) query.set("decided_by", filter.decided_by);
   return query.toString();
 }
 
@@ -239,7 +240,8 @@ export const api = {
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  initPassword: (password: string, setupToken: string) =>
+    post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
@@ -483,6 +485,39 @@ export const api = {
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  // exportAssets downloads assets. Selected scope passes asset IDs; filtered
+  // scope passes the current view's filters (type/dsl/company_id/task_id); all
+  // scope ignores filters. Mirrors exportFindings' download mechanism.
+  exportAssets: async (opts: {
+    format: "csv" | "json";
+    scope: "filtered" | "all" | "selected";
+    filters?: { type?: string; dsl?: string; company_id?: string; task_id?: string };
+    ids?: number[];
+  }) => {
+    const p = new URLSearchParams({ format: opts.format, scope: opts.scope });
+    if (opts.scope === "selected") {
+      p.set("ids", (opts.ids ?? []).join(","));
+    } else if (opts.scope === "filtered" && opts.filters) {
+      for (const [k, v] of Object.entries(opts.filters)) if (v) p.set(k, v);
+    }
+    const token = getToken();
+    const r = await fetch(`/api/assets/export?${p.toString()}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new Error(`export: ${r.status}`);
+    const blob = await r.blob();
+    const disp = r.headers.get("Content-Disposition") ?? "";
+    const m = disp.match(/filename="?([^"]+)"?/);
+    const filename = m?.[1] ?? `assets-export`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
   deleteAssets: (ids: number[]) =>
@@ -941,6 +976,7 @@ export const api = {
     profile_id?: number,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
+    user_agent = "", // non-empty = override User-Agent header on test request
   ) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -954,6 +990,7 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      user_agent,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -975,6 +1012,7 @@ export const api = {
     max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
+    user_agent?: string; // non-empty = override User-Agent header on every request; "" = keep default UA
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
@@ -1097,7 +1135,7 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
+  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
     post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
@@ -1216,6 +1254,9 @@ export const api = {
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
+  // No body: the server derives the rule from the stored request, which stays pending.
+  interceptAlwaysAllow: (id: number) =>
+    post<{ rule: InterceptRule; created: boolean }>(`/intercept/pending/${id}/always-allow`),
   interceptExecution: (id: number, conversationId?: number) =>
     get<import("@/lib/types").InterceptExecution>(
       `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,

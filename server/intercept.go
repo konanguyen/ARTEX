@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -34,17 +35,9 @@ func (s *Server) chatGuard() *guard.Guard {
 // runs a one-shot JSON classification with an explanation for every verdict.
 func (s *Server) wireInterceptReviewer() {
 	s.m.interceptor.SetReviewer(func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
-		if profileID == 0 {
-			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
-				profileID = p.ID
-			}
-		}
-		if profileID == 0 {
-			return intercept.Decision{}, fmt.Errorf("未配置可用的裁判模型")
-		}
-		prov, _, ok := s.providerForProfile(profileID)
-		if !ok {
-			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("裁判模型 profile %d 不可用", profileID)
+		prov, profileID, err := s.judgeProvider(profileID)
+		if err != nil {
+			return intercept.Decision{ProfileID: profileID}, err
 		}
 		// Tag this call's usage as the "judge" lane so the config page can report
 		// how much the fallback approval has spent, separate from model profiles.
@@ -55,10 +48,41 @@ func (s *Server) wireInterceptReviewer() {
 		}
 		v := intercept.ParseVerdict(text)
 		if v.Action == "" {
-			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("模型裁决格式无效，必须包含裁决、实际操作、成功后的后果和命中规则")
+			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("invalid model verdict format: must include verdict, actual operation, outcome on success, and matched rule")
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
 	})
+	// Closed mode: one call answers every question; intercept parses and decides.
+	s.m.interceptor.SetCompleter(func(ctx context.Context, profileID int64, system, user string) (string, int64, error) {
+		prov, profileID, err := s.judgeProvider(profileID)
+		if err != nil {
+			return "", profileID, err
+		}
+		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
+		text, err := streamCollectText(ctx, prov, system, user, closedJudgeMaxTokens)
+		return text, profileID, err
+	})
+}
+
+// closedJudgeMaxTokens bounds the closed-question reply: eight short answers
+// with one evidence line of at most 200 characters each.
+const closedJudgeMaxTokens = 1536
+
+// judgeProvider resolves the judge profile (0 -> active/default) to a provider.
+func (s *Server) judgeProvider(profileID int64) (llm.Provider, int64, error) {
+	if profileID == 0 {
+		if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
+			profileID = p.ID
+		}
+	}
+	if profileID == 0 {
+		return nil, 0, fmt.Errorf("no usable judge model is configured")
+	}
+	prov, _, ok := s.providerForProfile(profileID)
+	if !ok {
+		return nil, profileID, fmt.Errorf("judge model profile %d is unavailable", profileID)
+	}
+	return prov, profileID, nil
 }
 
 func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, input intercept.ReviewInput) (string, error) {
@@ -66,18 +90,18 @@ func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, inp
 	if err != nil {
 		return "", err
 	}
-	return streamCollectText(ctx, prov, prompt, string(user))
+	return streamCollectText(ctx, prov, prompt, string(user), 1024)
 }
 
 // streamCollectText runs a single non-streaming-style completion (thinking off,
 // low temperature, bounded output) and returns the concatenated text. The
 // budget includes the explanation and complete closing JSON delimiters.
-func streamCollectText(ctx context.Context, prov llm.Provider, system, user string) (string, error) {
+func streamCollectText(ctx context.Context, prov llm.Provider, system, user string, maxTokens int) (string, error) {
 	temp := 0.0
 	req := llm.CompletionRequest{
 		System:      []string{system},
 		Messages:    []llm.Message{llm.UserText(user)},
-		MaxTokens:   1024,
+		MaxTokens:   maxTokens,
 		Temperature: &temp,
 		Thinking:    "disabled",
 	}
@@ -321,14 +345,14 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
-	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source")}
+	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source"), DecidedBy: q.Get("decided_by")}
 	switch filter.Status {
 	case "", "all", "pending", "allowed", "denied", "timeout":
 		if filter.Status == "all" {
 			filter.Status = ""
 		}
 	default:
-		return filter, fmt.Errorf("status 必须是 pending、allowed、denied 或 timeout")
+		return filter, fmt.Errorf("status must be pending, allowed, denied or timeout")
 	}
 	switch filter.DecisionSource {
 	case "", "all", "model", "rule", "unknown":
@@ -336,7 +360,15 @@ func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
 			filter.DecisionSource = ""
 		}
 	default:
-		return filter, fmt.Errorf("decision_source 必须是 model、rule 或 unknown")
+		return filter, fmt.Errorf("decision_source must be model, rule or unknown")
+	}
+	switch filter.DecidedBy {
+	case "", "all", "human", "rule", "model", "system":
+		if filter.DecidedBy == "all" {
+			filter.DecidedBy = ""
+		}
+	default:
+		return filter, fmt.Errorf("decided_by must be human, rule, model or system")
 	}
 	return filter, nil
 }
@@ -370,7 +402,7 @@ func (s *Server) interceptDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Decision != "allowed" && req.Decision != "denied" {
-		writeErr(w, 400, "decision 必须是 allowed 或 denied")
+		writeErr(w, 400, "decision must be allowed or denied")
 		return
 	}
 	if err := s.m.interceptor.Decide(id, req.Decision == "allowed"); err != nil {
@@ -384,7 +416,68 @@ func (s *Server) interceptDecide(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// --- tool-config (全局工具拦截范围) ---
+// alwaysAllowPriority places "always allow" rules below every default and
+// manual rule, so any deny or ask rule that matches the same call wins.
+const alwaysAllowPriority = -1000
+
+// interceptAlwaysAllow creates an argv allow rule from a pending Bash request.
+// The request body is never read: the command comes from the stored row, so a
+// caller cannot choose what gets allowed. The request itself stays pending.
+func (s *Server) interceptAlwaysAllow(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "bad pending id")
+		return
+	}
+	p, err := pg.GetInterceptPending(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	if p.Status != "pending" {
+		writeErr(w, 409, "the request is no longer pending")
+		return
+	}
+	prefix, err := intercept.AlwaysAllowPrefix(p.ToolName, p.ToolInput)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	pattern, _ := json.Marshal(prefix)
+	rules, err := pg.ListInterceptRules()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	for _, rule := range rules {
+		if rule.MatchType != "argv" || rule.Action != "allow" || !rule.Enabled || rule.MatchTarget != "tool_input" {
+			continue
+		}
+		if tokens, err := intercept.ParseArgvPattern(rule.Pattern); err == nil && slices.Equal(tokens, prefix) {
+			writeJSON(w, 200, map[string]any{"rule": rule, "created": false})
+			return
+		}
+	}
+	// Timeout fields take the rule form's defaults.
+	rule, err := pg.CreateInterceptRule("always-allow: "+strings.Join(prefix, " "), "tool_input", "argv", string(pattern),
+		"allow", "", alwaysAllowPriority, true, true, 60, "deny")
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.m.interceptor.Invalidate()
+	writeJSON(w, 200, map[string]any{"rule": rule, "created": true})
+}
+
+// --- tool-config (global tool intercept scope) ---
 
 // interceptGetToolConfig returns the list of tool names that are currently
 // configured to enter the intercept rule system.
@@ -417,7 +510,7 @@ func (s *Server) interceptSetToolConfig(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// --- LLM fallback judge config (全局模型兜底) ---
+// --- LLM fallback judge config (global model fallback) ---
 
 // interceptGetJudgeConfig returns the resolved judge configuration. Prompt is the
 // effective prompt (built-in template when unset), so the UI can prefill it.
@@ -432,16 +525,22 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, err.Error())
 		return
 	}
+	switch req.Mode {
+	case "", intercept.JudgeModeClosed, intercept.JudgeModeFreeform:
+	default:
+		writeErr(w, 400, "mode must be closed or freeform")
+		return
+	}
 	switch req.FailAction {
 	case "allow", "ask", "deny":
 	default:
-		writeErr(w, 400, "fail_action 必须是 allow、ask 或 deny")
+		writeErr(w, 400, "fail_action must be allow, ask or deny")
 		return
 	}
 	switch req.AskTimeoutAction {
 	case "allow", "deny":
 	default:
-		writeErr(w, 400, "ask_timeout_action 必须是 allow 或 deny")
+		writeErr(w, 400, "ask_timeout_action must be allow or deny")
 		return
 	}
 	if err := s.m.interceptor.SetJudgeConfig(req); err != nil {
@@ -486,30 +585,42 @@ type interceptRuleReq struct {
 
 func validateInterceptRuleReq(req interceptRuleReq) error {
 	if req.Name == "" {
-		return fmt.Errorf("name 不能为空")
+		return fmt.Errorf("name cannot be empty")
 	}
 	switch req.MatchTarget {
 	case "tool_name", "tool_input":
 	default:
-		return fmt.Errorf("match_target 必须是 tool_name 或 tool_input")
-	}
-	switch req.MatchType {
-	case "string", "regex":
-	default:
-		return fmt.Errorf("match_type 必须是 string 或 regex")
+		return fmt.Errorf("match_target must be tool_name or tool_input")
 	}
 	if req.Pattern == "" {
-		return fmt.Errorf("pattern 不能为空")
+		return fmt.Errorf("pattern cannot be empty")
 	}
 	switch req.Action {
 	case "allow", "deny", "ask":
 	default:
-		return fmt.Errorf("action 必须是 allow、deny 或 ask")
+		return fmt.Errorf("action must be allow, deny or ask")
 	}
-	if req.MatchType == "regex" {
+	switch req.MatchType {
+	case "string":
+	case "regex":
 		if _, err := regexp.Compile(req.Pattern); err != nil {
-			return fmt.Errorf("pattern 不是有效正则：%w", err)
+			return fmt.Errorf("pattern is not a valid regex: %w", err)
 		}
+	case "argv":
+		if req.MatchTarget != "tool_input" {
+			return fmt.Errorf("an argv rule matches tool_input (the Bash command)")
+		}
+		tokens, err := intercept.ParseArgvPattern(req.Pattern)
+		if err != nil {
+			return fmt.Errorf("invalid argv pattern: %w", err)
+		}
+		if req.Action == "allow" {
+			if err := intercept.CheckArgvAllow(tokens); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("match_type must be string, regex or argv")
 	}
 	return nil
 }
@@ -533,7 +644,18 @@ func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, detail)
+	// The "always allow" button label: the prefix the endpoint would allow,
+	// derived here so the UI never parses the command.
+	out := struct {
+		*db.InterceptDetail
+		AlwaysAllowPrefix string `json:"always_allow_prefix,omitempty"`
+	}{InterceptDetail: detail}
+	if detail.Status == "pending" {
+		if prefix, err := intercept.AlwaysAllowPrefix(detail.ToolName, detail.ToolInput); err == nil {
+			out.AlwaysAllowPrefix = strings.Join(prefix, " ")
+		}
+	}
+	writeJSON(w, 200, out)
 }
 
 // The navigation endpoint returns only the original call and its paired result.
@@ -575,7 +697,7 @@ func (s *Server) interceptExecution(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeErr(w, 404, "审批记录已被删除或不存在")
+		writeErr(w, 404, "approval record not found or deleted")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"conversation_id": target.ConversationID, "task_id": target.TaskID, "session": target.Session, "seq": target.Seq, "items": activityDTOs(target.Items)})

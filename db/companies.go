@@ -451,12 +451,12 @@ func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason
 func insertScopeRuleTx(tx *sql.Tx, companyID int64, rule ParsedScope, reason string) (inserted bool, err error) {
 	var res interface{ RowsAffected() (int64, error) }
 	switch rule.Kind {
-	case "domain":
+	case "domain", "host":
 		res, err = tx.Exec(`
 INSERT INTO company_scope(company_id, kind, domain, raw, reason)
-VALUES ($1, 'domain', $2, $3, $4)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT uq_sv2_domain DO NOTHING`,
-			companyID, rule.Domain, rule.Raw, reason)
+			companyID, rule.Kind, rule.Domain, rule.Raw, reason)
 	case "ip", "cidr":
 		res, err = tx.Exec(`
 INSERT INTO company_scope(company_id, kind, net, raw, reason)
@@ -480,8 +480,8 @@ ON CONFLICT (company_id, kind, value) WHERE kind IN ('icp','keyword') DO NOTHING
 }
 
 // RecomputeAttribution rebuilds only scope-derived ownership. Explicit company
-// links are immutable under scope edits. Precedence is domain, IP/CIDR, then
-// normalized exact ICP; keyword rules never attribute assets.
+// links are immutable under scope edits. Precedence is host, then domain, then
+// IP/CIDR, then normalized exact ICP; keyword rules never attribute assets.
 func (s *CompanyStore) RecomputeAttribution() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -513,16 +513,27 @@ WHERE company_source = 'scope'`); err != nil {
 		return "", err
 	}
 
-	// Domain-based attribution (root_domain exact match).
+	// Host-based attribution. The asset host is its `domain` column, falling
+	// back to `root_domain` for rows that only carry the registrable name
+	// (type='root_domain' stores both). A `host` entry covers exactly its own
+	// name; a `domain` entry covers its name and every name under it. Suffix
+	// comparison, not LIKE: DNS labels may contain '_', which LIKE treats as
+	// a wildcard. Precedence: host before domain, then the longest entry, then
+	// company id.
 	if _, err := tx.Exec(`
 WITH matched AS (
     SELECT DISTINCT ON (a.id) a.id AS asset_id, cs.company_id
     FROM assets a
-    JOIN company_scope cs ON cs.kind = 'domain' AND a.root_domain = cs.domain
+    JOIN company_scope cs ON cs.kind IN ('host','domain')
+      AND COALESCE(NULLIF(a.domain, ''), a.root_domain) IS NOT NULL
+      AND (COALESCE(NULLIF(a.domain, ''), a.root_domain) = cs.domain
+           OR (cs.kind = 'domain'
+               AND right(COALESCE(NULLIF(a.domain, ''), a.root_domain), length(cs.domain) + 1)
+                   = '.' || cs.domain))
     WHERE a.company_id IS NULL
       AND a.type IN ('root_domain','subdomain','service','endpoint')
-      AND a.root_domain IS NOT NULL
-    ORDER BY a.id, length(cs.domain) DESC, cs.company_id
+    ORDER BY a.id, CASE WHEN cs.kind = 'host' THEN 0 ELSE 1 END,
+             length(cs.domain) DESC, cs.company_id
 )
 UPDATE assets a
 SET company_id = matched.company_id, company_source = 'scope'
@@ -713,36 +724,50 @@ func (s *CompanyStore) UpdateScopeInputsChecked(companyID int64, inputs []ScopeI
 	return added, invalid, errs, nil
 }
 
-// ResolveCompany returns the company_id for a given root_domain and/or ip, or nil
-// if no scope rule matches. Mirrors the attribution logic used at asset insert time.
-func (s *CompanyStore) ResolveCompany(rootDomain, ipStr string) (*int64, error) {
-	return s.ResolveCompanyWithICP(rootDomain, ipStr, "")
+// ResolveCompany returns the company_id for a given asset host name and/or ip,
+// or nil if no scope rule matches. Mirrors the attribution logic used at asset
+// insert time; pass the asset's full host name (its `domain` column), not the
+// registrable root.
+func (s *CompanyStore) ResolveCompany(host, ipStr string) (*int64, error) {
+	return s.ResolveCompanyWithICP(host, ipStr, "")
 }
 
 // ResolveCompanyWithICP mirrors RecomputeAttribution for insert-time ownership.
-// ICP is consulted only after domain and IP/CIDR fail to match.
-func (s *CompanyStore) ResolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
-	return resolveCompanyWithICP(s.db, rootDomain, ipStr, icp)
+// ICP is consulted only after host and IP/CIDR fail to match.
+func (s *CompanyStore) ResolveCompanyWithICP(host, ipStr, icp string) (*int64, error) {
+	return resolveCompanyWithICP(s.db, host, ipStr, icp)
 }
 
 type companyScopeQueryer interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-func resolveCompanyWithICP(q companyScopeQueryer, rootDomain, ipStr, icp string) (*int64, error) {
-	if rootDomain != "" {
-		var cid int64
-		err := q.QueryRow(`
+// resolveCompanyByHost finds the company whose scope entry claims a host name.
+// A `host` entry matches only that exact name and wins over a `domain` entry
+// that also covers it; among domain entries the longest (most specific) wins,
+// then the lowest company id — the same order the recompute uses.
+func resolveCompanyByHost(q companyScopeQueryer, host string) (*int64, error) {
+	var cid int64
+	err := q.QueryRow(`
 SELECT company_id FROM company_scope
-WHERE kind = 'domain'
-  AND domain = $1
-ORDER BY length(domain) DESC, company_id
-LIMIT 1`, rootDomain).Scan(&cid)
-		if err == nil {
-			return &cid, nil
-		}
-		if err != sql.ErrNoRows {
-			return nil, err
+WHERE kind IN ('host','domain')
+  AND (domain = $1 OR (kind = 'domain' AND right($1, length(domain) + 1) = '.' || domain))
+ORDER BY CASE WHEN kind = 'host' THEN 0 ELSE 1 END, length(domain) DESC, company_id
+LIMIT 1`, host).Scan(&cid)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cid, nil
+}
+
+func resolveCompanyWithICP(q companyScopeQueryer, host, ipStr, icp string) (*int64, error) {
+	if host != "" {
+		// No host/domain match falls through to IP/CIDR and ICP, as before.
+		if cid, err := resolveCompanyByHost(q, host); err != nil || cid != nil {
+			return cid, err
 		}
 	}
 	if ipStr != "" {

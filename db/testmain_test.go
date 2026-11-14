@@ -14,6 +14,8 @@ import (
 // avoid cross-package cleanup races (e.g. DELETE FROM assets WHERE id > X
 // from one package deleting assets created by another).
 func TestMain(m *testing.M) {
+	box, _ := newSecretBox(testSecretKey)
+	activeSecretBox.Store(box)
 	dsn, _, err := DSN()
 	if err != nil {
 		// No DB configured — tests that need PG will skip themselves.

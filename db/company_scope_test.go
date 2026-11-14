@@ -104,6 +104,125 @@ func TestParseAutoScopeLine(t *testing.T) {
 	}
 }
 
+// TestDomainScopeMatchesSubdomains pins the host-suffix rule in both
+// attribution paths: a `domain` entry covers its own name and every name
+// under it, never a look-alike that merely ends with the same characters.
+func TestDomainScopeMatchesSubdomains(t *testing.T) {
+	d, as, cs := testSetup(t)
+	defer d.Close()
+
+	stamp := time.Now().UnixNano()
+	suffix := uint64(stamp) & 0xffffff
+	company, _, err := cs.UpsertCompany(fmt.Sprintf("Suffix Match %d", stamp), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupCompany(d, company) })
+
+	apex := fmt.Sprintf("suffix-%d.example", suffix)
+	rules := []ScopeInput{{Kind: "domain", Value: apex}}
+	if added, _, invalid, errs := cs.AddScopeInputs(company, rules, "test"); added != len(rules) || invalid != 0 {
+		t.Fatalf("AddScopeInputs: added=%d invalid=%d errors=%v", added, invalid, errs)
+	}
+
+	assertOwner := func(label string, id int64, want *int64) {
+		t.Helper()
+		var got *int64
+		if err := d.QueryRow(`SELECT company_id FROM assets WHERE id=$1`, id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case want == nil && got != nil:
+			t.Fatalf("%s: attributed to %d, want unattributed", label, *got)
+		case want != nil && (got == nil || *got != *want):
+			t.Fatalf("%s: company=%v want %d", label, got, *want)
+		}
+	}
+
+	cases := []struct {
+		host      string
+		attribute bool
+	}{
+		{apex, true},
+		{"www." + apex, true},
+		{"a.b." + apex, true},
+		{"evil" + apex, false},
+	}
+
+	// Insert-time resolution (UpsertSubdomain resolves by the asset's own host).
+	inserted := make(map[string]int64, len(cases))
+	for _, c := range cases {
+		id, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: c.host})
+		if err != nil {
+			t.Fatalf("upsert %s: %v", c.host, err)
+		}
+		inserted[c.host] = id
+		want := &company
+		if !c.attribute {
+			want = nil
+		}
+		assertOwner("insert-time "+c.host, id, want)
+	}
+
+	// The recompute must agree with insert-time resolution.
+	if err := cs.RecomputeAttribution(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		want := &company
+		if !c.attribute {
+			want = nil
+		}
+		assertOwner("recomputed "+c.host, inserted[c.host], want)
+	}
+}
+
+func TestParseHostScopeInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		domain  string
+		wantErr bool
+	}{
+		{name: "subdomain", value: "cms.example.no", domain: "cms.example.no"},
+		{name: "url with port and path", value: "https://cms.example.no:8443/x", domain: "cms.example.no"},
+		{name: "uppercase", value: "CMS.Example.NO", domain: "cms.example.no"},
+		{name: "apex", value: "example.no", domain: "example.no"},
+		{name: "ipv4", value: "8.8.8.8", wantErr: true},
+		{name: "ipv6", value: "2001:db8::10", wantErr: true},
+		{name: "bare tld", value: "no", wantErr: true},
+		{name: "public suffix", value: "co.uk", wantErr: true},
+		{name: "empty", value: "   ", wantErr: true},
+		{name: "invalid label", value: "cms..example.no", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rule, err := ParseScopeInput(ScopeInput{Kind: "host", Value: tc.value})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ParseScopeInput(host %q) = %+v, want error", tc.value, rule)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseScopeInput(host %q): %v", tc.value, err)
+			}
+			if rule.Kind != "host" || rule.Domain != tc.domain {
+				t.Fatalf("host %q parsed as kind=%q domain=%q want %q", tc.value, rule.Kind, rule.Domain, tc.domain)
+			}
+		})
+	}
+
+	// An untyped subdomain line stays a domain entry: the textarea is unchanged.
+	auto, err := ParseAutoScopeLine("cms.example.no")
+	if err != nil {
+		t.Fatalf("auto parse: %v", err)
+	}
+	if auto.Kind != "domain" || auto.Domain != "cms.example.no" {
+		t.Fatalf("untyped cms.example.no parsed as %+v, want domain", auto)
+	}
+}
+
 func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	d, as, cs := testSetup(t)
 	defer d.Close()
@@ -402,4 +521,149 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("UpsertIP out: %v", err)
 	}
 	mustNil(ipOutID, "out-of-CIDR ip")
+
+	// A host no domain entry covers still falls through to the IP rule.
+	svcID, err := as.UpsertHTTPService(UpsertHTTPServiceReq{URL: "https://web." + outDomain + "/", IP: ipIn})
+	if err != nil {
+		t.Fatalf("UpsertHTTPService: %v", err)
+	}
+	mustCid(svcID, cid, "out-of-scope host on in-CIDR ip (insert-time)")
+}
+
+// TestHostScopeAttribution pins the `host` entry rule in both attribution
+// paths: a host entry claims exactly its own name, never anything under it,
+// and wins over a broader `domain` entry owned by another company.
+func TestHostScopeAttribution(t *testing.T) {
+	d, as, cs := testSetup(t)
+	defer d.Close()
+
+	stamp := time.Now().UnixNano()
+	suffix := uint64(stamp) & 0xffffff
+	domainCompany, _, err := cs.UpsertCompany(fmt.Sprintf("Host Scope Domain %d", stamp), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostCompany, _, err := cs.UpsertCompany(fmt.Sprintf("Host Scope Host %d", stamp), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCompany(d, domainCompany)
+		cleanupCompany(d, hostCompany)
+	})
+
+	apex := fmt.Sprintf("hostscope-%d.example", suffix)
+	cms := "cms." + apex
+	if added, _, invalid, errs := cs.AddScopeInputs(domainCompany, []ScopeInput{
+		{Kind: "domain", Value: apex},
+	}, "test"); added != 1 || invalid != 0 {
+		t.Fatalf("add domain scope: added=%d invalid=%d errors=%v", added, invalid, errs)
+	}
+	if added, _, invalid, errs := cs.AddScopeInputs(hostCompany, []ScopeInput{
+		{Kind: "host", Value: cms},
+	}, "test"); added != 1 || invalid != 0 {
+		t.Fatalf("add host scope: added=%d invalid=%d errors=%v", added, invalid, errs)
+	}
+
+	assertOwner := func(label string, id int64, want int64) {
+		t.Helper()
+		var got *int64
+		if err := d.QueryRow(`SELECT company_id FROM assets WHERE id=$1`, id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || *got != want {
+			t.Fatalf("%s: company=%v want %d", label, got, want)
+		}
+	}
+
+	// Insert-time resolution: the host entry wins over the covering domain entry.
+	apexID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: apex})
+	if err != nil {
+		t.Fatalf("upsert apex: %v", err)
+	}
+	assertOwner("insert-time apex", apexID, domainCompany)
+
+	cmsID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: cms})
+	if err != nil {
+		t.Fatalf("upsert cms: %v", err)
+	}
+	assertOwner("insert-time host entry", cmsID, hostCompany)
+
+	childID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: "x." + cms})
+	if err != nil {
+		t.Fatalf("upsert child of host: %v", err)
+	}
+	assertOwner("insert-time child of host entry", childID, domainCompany)
+
+	wwwID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: "www." + apex})
+	if err != nil {
+		t.Fatalf("upsert www: %v", err)
+	}
+	assertOwner("insert-time www", wwwID, domainCompany)
+
+	// The recompute must agree with insert-time resolution.
+	if err := cs.RecomputeAttribution(); err != nil {
+		t.Fatal(err)
+	}
+	assertOwner("recomputed apex", apexID, domainCompany)
+	assertOwner("recomputed host entry", cmsID, hostCompany)
+	assertOwner("recomputed child of host entry", childID, domainCompany)
+	assertOwner("recomputed www", wwwID, domainCompany)
+}
+
+// A host rule from the shared scope editor is exactly one hostname, so it must
+// land as task scope kind=subdomain (not root_domain) on its own asset row.
+func TestRegisterTaskAssetScopesHostIsExactSubdomain(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+
+	task, err := d.CreateTask("host scope registration", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	suffix := time.Now().UnixNano()
+	apex := fmt.Sprintf("host-scope-%d.com", suffix)
+	host := "cms." + apex
+
+	mutation, err := d.Assets().RegisterTaskAssetScopes(task.ID, []ScopeInput{{Kind: "host", Value: host}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.AssetsLinked != 1 || mutation.ScopesAdded != 1 {
+		t.Fatalf("unexpected host mutation: %+v", mutation)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM assets WHERE domain IN ($1,$2)`, host, apex)
+	})
+	scopes, err := d.Assets().ListTaskScope(task.ID)
+	if err != nil || len(scopes) != 1 || scopes[0].Kind != "subdomain" || scopes[0].Domain != host {
+		t.Fatalf("host task scope=%+v err=%v", scopes, err)
+	}
+	var subdomainAssets int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE type='subdomain' AND domain=$1 AND $2=ANY(task_ids)`, host, task.ID).Scan(&subdomainAssets); err != nil {
+		t.Fatal(err)
+	}
+	if subdomainAssets != 1 {
+		t.Fatalf("host rule linked %d subdomain assets, want 1", subdomainAssets)
+	}
+
+	// An apex host reuses the root_domain asset instead of a subdomain row.
+	mutation, err = d.Assets().RegisterTaskAssetScopes(task.ID, []ScopeInput{{Kind: "host", Value: apex}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.ScopesAdded != 1 {
+		t.Fatalf("unexpected apex host mutation: %+v", mutation)
+	}
+	var apexSubdomains int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE type='subdomain' AND domain=$1`, apex).Scan(&apexSubdomains); err != nil {
+		t.Fatal(err)
+	}
+	if apexSubdomains != 0 {
+		t.Fatalf("apex host created %d subdomain rows", apexSubdomains)
+	}
 }

@@ -14,8 +14,8 @@ import (
 // ParsedScope is one parsed asset-scope entry. Its kind selects Domain, Net, or Value.
 // Used internally by the company scope parsers and CompanyStore.
 type ParsedScope struct {
-	Kind   string // "domain" | "ip" | "cidr" | "icp" | "keyword"
-	Domain string // normalized registrable/root domain (kind=domain)
+	Kind   string // "domain" | "host" | "ip" | "cidr" | "icp" | "keyword"
+	Domain string // normalized name as given (kind=domain|host)
 	Net    string // normalized CIDR, single IP as /32 or /128 (kind=ip|cidr)
 	Value  string // normalized text (kind=icp|keyword)
 	Raw    string // original input line
@@ -104,6 +104,28 @@ func ParseScopeInput(input ScopeInput) (ParsedScope, error) {
 			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("%q is not a valid %s scope", raw, kind)
 		}
 		return rule, nil
+	case "host":
+		// A host entry names exactly one name and never grows to subdomains.
+		// Same guardrails as a domain line: no IP literal, no bare TLD/public
+		// suffix, no empty value.
+		if raw == "" {
+			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("hostname is empty")
+		}
+		if looksLikeIPAddress(raw) {
+			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("%q is not a valid %s scope", raw, kind)
+		}
+		host, err := scopeHostname(raw)
+		if err != nil {
+			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("not a valid host: %s", raw)
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("%q is not a valid %s scope", raw, kind)
+		}
+		d := DomainKey(host)
+		if suf, icann := publicsuffix.PublicSuffix(d); icann && suf == d {
+			return ParsedScope{Kind: kind, Raw: raw}, fmt.Errorf("a bare TLD cannot be used as a scope: %s", raw)
+		}
+		return ParsedScope{Kind: kind, Domain: d, Raw: raw}, nil
 	case "icp":
 		value := NormalizeICP(raw)
 		if value == "" {

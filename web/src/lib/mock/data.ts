@@ -3496,6 +3496,7 @@ interceptHistory.unshift({
   tool_input: { path: "reports/summary.md", content: "# 检查摘要\n\n本轮验证已完成，整理已有证据与后续建议。" },
   status: "allowed",
   decision_source: "model",
+  decided_by: "model",
   reason: "[模型] 将已有检查结论写入本地报告，不修改业务数据。",
   created_at: T("2026-07-26T08:00:00Z"),
   decided_at: T("2026-07-26T08:00:02Z"),

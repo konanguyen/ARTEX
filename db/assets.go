@@ -124,11 +124,14 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 	return id, nil
 }
 
-func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
+// resolveCompanyWithICP resolves the owning company for an asset. `host` is
+// the asset's full host name (its `domain` column), not the registrable root;
+// pass "" for assets with no host name.
+func (s *AssetStore) resolveCompanyWithICP(host, ipStr, icp string) (*int64, error) {
 	if s.tx != nil {
-		return resolveCompanyWithICP(s.tx, rootDomain, ipStr, icp)
+		return resolveCompanyWithICP(s.tx, host, ipStr, icp)
 	}
-	return s.company.ResolveCompanyWithICP(rootDomain, ipStr, icp)
+	return s.company.ResolveCompanyWithICP(host, ipStr, icp)
 }
 
 // =====================================================================
@@ -466,8 +469,8 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		rootDomain = domain
 	}
 
-	// Resolve by root domain first, then the asset's exact normalized ICP.
-	companyID, err := s.resolveCompanyWithICP(rootDomain, "", req.ICP)
+	// Resolve by the asset's own host name first, then its exact normalized ICP.
+	companyID, err := s.resolveCompanyWithICP(domain, "", req.ICP)
 	if err != nil {
 		return 0, err
 	}
@@ -700,7 +703,7 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	}
 
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	companyID, err := s.resolveCompanyWithICP(domain, req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -849,7 +852,7 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	}
 
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	companyID, err := s.resolveCompanyWithICP(domain, req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -984,7 +987,7 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	}
 
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	companyID, err := s.resolveCompanyWithICP(domain, req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -1392,6 +1395,96 @@ func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// AssetExportFilter carries the optional filtered-scope conditions for
+// ListAssetsForExport. Only one of DSL / CompanyID / TaskID drives the query,
+// mirroring the branch selection in the listAssets handler: DSL wins, then
+// company_id, then task_id, then the default root_domain view.
+type AssetExportFilter struct {
+	Type      string
+	TaskID    int64
+	CompanyID int64
+	DSL       string
+}
+
+// ListAssetsForExport exports assets without pagination, mirroring
+// ListFindingsForExport. Nonempty ids exports precisely the selected assets and
+// ignores filter; empty ids exports by filter (current filters/all). One
+// unpaginated query per scope; no row cap (findings has none either).
+func (s *AssetStore) ListAssetsForExport(f AssetExportFilter, ids []int64) ([]*Asset, error) {
+	if len(ids) > 0 {
+		return s.GetByIDs(ids)
+	}
+	if f.DSL != "" {
+		return s.queryDSLForExport(f)
+	}
+	return s.queryPlainForExport(f)
+}
+
+// queryDSLForExport is QueryDSL without LIMIT/OFFSET: same WHERE builder, same
+// type/task scoping, same per-task source hydration.
+func (s *AssetStore) queryDSLForExport(f AssetExportFilter) ([]*Asset, error) {
+	node, err := ParseDSL(f.DSL)
+	if err != nil {
+		return nil, err
+	}
+	where, args, err := buildDSLWhere(node)
+	if err != nil {
+		return nil, err
+	}
+	if f.Type != "" {
+		args = append(args, f.Type)
+		where += fmt.Sprintf(" AND type = $%d", len(args))
+	}
+	if f.TaskID > 0 {
+		args = append(args, f.TaskID)
+		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+	}
+	q := assetSelectCols + " WHERE " + where + " ORDER BY last_seen DESC, id DESC"
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	assets, err := scanAssets(rows)
+	if err != nil {
+		return nil, err
+	}
+	if f.TaskID > 0 {
+		if err := s.hydrateTaskAssetSources(f.TaskID, assets); err != nil {
+			return nil, err
+		}
+	}
+	return assets, nil
+}
+
+// queryPlainForExport mirrors the non-DSL branch of listAssets: company_id wins,
+// then task_id, then the type-or-all view. Unlike QueryByType (a UI-paging
+// helper that clamps limit<=0 to 50 and forces a type), the final branch is a
+// genuinely unbounded export query: optional type filter only, no LIMIT, and no
+// root_domain default — an empty Type means every type (scope=all).
+func (s *AssetStore) queryPlainForExport(f AssetExportFilter) ([]*Asset, error) {
+	switch {
+	case f.CompanyID > 0:
+		return s.QueryByCompany(f.CompanyID, f.Type, 0, 0)
+	case f.TaskID > 0:
+		return s.QueryByTask(f.TaskID, f.Type, 0, 0)
+	default:
+		q := assetSelectCols
+		var args []any
+		if f.Type != "" {
+			args = append(args, f.Type)
+			q += fmt.Sprintf(" WHERE type = $%d", len(args))
+		}
+		q += " ORDER BY last_seen DESC, id DESC"
+		rows, err := s.db.Query(q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanAssets(rows)
+	}
 }
 
 // DeleteByHost hard-deletes every asset whose host exactly matches the given value:

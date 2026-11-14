@@ -13,6 +13,8 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	// Fixed test key via env: NewManager's InitSecrets then writes no key file.
+	os.Setenv("ARTEX_SECRET_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

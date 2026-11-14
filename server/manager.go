@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
@@ -271,6 +272,11 @@ const (
 	// 任务并发上限:开关 + 上限数。默认关闭;开启后默认上限 5(见 defaultConcurrencyLimit)。
 	settingConcurrencyOn    = "task_concurrency_enabled"
 	settingConcurrencyLimit = "task_concurrency_limit"
+	// llm_max_concurrent caps simultaneous in-flight LLM requests per profile
+	// (0/unset = unlimited). Each profile's provider gets its own semaphore, shared
+	// across its agents. For self-hosted backends with a hard per-access concurrency
+	// limit; the rate limiter only smooths rate, not concurrency.
+	settingLLMMaxConcurrent = "llm_max_concurrent"
 	// 实验功能:noa 模型驱动上下文压缩(norma v0.4.0)。默认关闭——开启后平台接入的四类
 	// agent(planner/worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction。
 	// 每 run 读一次,切换只影响之后启动的 run。
@@ -336,6 +342,29 @@ func (m *Manager) SetWorkers(n int) error {
 	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
 }
 
+// LLMMaxConcurrent returns the per-profile cap on simultaneous in-flight LLM
+// requests (0 = unlimited). Each profile's provider gets its own semaphore, shared
+// across its agents. Invalid stored values fall back to unlimited.
+func (m *Manager) LLMMaxConcurrent() int {
+	v, ok, err := m.pg.GetSetting(settingLLMMaxConcurrent)
+	if err != nil || !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// SetLLMMaxConcurrent persists the cap. Values <0 are rejected; 0 means unlimited.
+func (m *Manager) SetLLMMaxConcurrent(n int) error {
+	if n < 0 {
+		return fmt.Errorf("llm_max_concurrent must be zero (unlimited) or greater")
+	}
+	return m.pg.SetSetting(settingLLMMaxConcurrent, strconv.Itoa(n))
+}
+
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
@@ -362,6 +391,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	pg, err := pgdb.Open(dsn)
 	if err != nil {
 		return nil, err
+	}
+	// Before anything reads a stored secret: load the key, encrypt legacy plaintext.
+	if err := pg.InitSecrets(config.KeyDir()); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("secrets at rest: %w", err)
 	}
 	if err := pg.RecoverFindingRetests(); err != nil {
 		pg.Close()

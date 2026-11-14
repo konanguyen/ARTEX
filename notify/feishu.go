@@ -112,47 +112,87 @@ func feishuSeverityTemplate(severity string) string {
 	}
 }
 
-// feishuMaxCardBytes 是卡片内容的保守上限。飞书对卡片有体积限制，超了整条被拒；
-// 取一个明显低于官方上限的值，把 JSON 包装开销也算进来。
-const feishuMaxCardBytes = 24000
+// feishuMaxCardBytes is a conservative cap on card content. Feishu custom bots
+// reject a request body over 20 KB as a whole (not truncated); pick a value
+// clearly below that limit to also cover JSON wrapping overhead.
+const feishuMaxCardBytes = 16000
+
+// feishuEnvelopeBytes is the size of what Send serializes around the card when a
+// signing secret is configured (without one the request is smaller):
+//
+//	{"card":…,"msg_type":"interactive","sign":"<44 characters>","timestamp":"<10 digits>"}
+const feishuEnvelopeBytes = 113
 
 // feishuCard 构造交互式卡片，返回卡片与**实际写入的条目数**。
 // kept 的用途同 markdownBody：只有真正进了卡片的条目才该被标记为已送达。
 func feishuCard(m Message) (map[string]any, int) {
+	lim := m.limits()
+	// budget is the final truncation backstop for one item's text, the same role
+	// TruncateBytes plays in markdownBody. With the summary or asset limit set to
+	// 0 an item has no other bound, and an oversized card loses the whole message.
+	budget := feishuMaxCardBytes - markdownReservedBytes
+	card := map[string]any{
+		"config": map[string]any{"wide_screen_mode": true},
+		"header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": markdownTitle(m)}},
+	}
+	if len(m.Items) > 0 {
+		card["header"].(map[string]any)["template"] = feishuSeverityTemplate(m.Items[0].Severity)
+	}
 	elements := []any{}
 	kept := 0
 	if m.Batch {
-		// 先按整条打包再拼头部：头部要写「其余 N 条将在下一条消息继续」，
-		// N 必须来自实际装下的条数。
-		kept = packItemCount(m.Items, feishuMaxCardBytes, markdownReservedBytes, "", byteSize, func(it Item, idx int) string {
-			return feishuBatchLine(it, idx+1)
-		})
-		items := m.Items[:kept]
-		elements = append(elements, feishuMarkdownDiv(markdownBatchIntro(m, items, len(m.Items))))
-		for i, it := range items {
-			elements = append(elements, feishuMarkdownDiv(feishuBatchLine(it, i+1)))
+		// digest assembles the elements of a digest card around the lines of its
+		// first n items. The intro must state "the remaining N items will continue
+		// in the next message", and N must come from the number of items that
+		// actually fit.
+		digest := func(n int, lines []any) []any {
+			out := []any{feishuMarkdownDiv(markdownBatchIntro(m, m.Items[:n], len(m.Items)))}
+			out = append(out, lines...)
+			if m.HomeURL != "" {
+				out = append(out, feishuButton("View All on Platform", m.HomeURL))
+			}
+			return out
 		}
-		if m.HomeURL != "" {
-			elements = append(elements, feishuButton("View All on Platform", m.HomeURL))
+		// Pack whole items (see packItemCount) against the request body as it will
+		// be serialized, not against the text of the lines. Each line is sent as
+		// its own element: about 52 bytes of JSON around the text, plus whatever
+		// the encoding escapes. Counted as text alone, several hundred short lines
+		// left as one request of more than twice the 20 KB limit. The rest of the
+		// body is measured too: it changes with the number of items kept (the
+		// intro) and with the platform link.
+		//
+		// The first item is always kept: otherwise one oversized item would jam
+		// the whole batch in place. Its text is truncated to budget.
+		var lines []any
+		used := 0
+		for i, it := range m.Items {
+			line := feishuMarkdownDiv(TruncateBytes(feishuBatchLine(it, i+1, lim), budget))
+			used += feishuJSONSize(line) + 1 // the element and its separating comma
+			card["elements"] = digest(i+1, nil)
+			if i > 0 && feishuEnvelopeBytes+feishuJSONSize(card)+used > feishuMaxCardBytes {
+				break
+			}
+			lines = append(lines, line)
 		}
+		kept = len(lines)
+		elements = digest(kept, lines)
 	} else if len(m.Items) > 0 {
 		kept = 1
 		it := m.Items[0]
-		elements = append(elements, feishuMarkdownDiv(feishuItemLines(it)))
+		elements = append(elements, feishuMarkdownDiv(TruncateBytes(feishuItemLines(it, lim), budget)))
 		if it.DetailURL != "" {
 			elements = append(elements, feishuButton("View Details", it.DetailURL))
 		}
 	}
 
-	card := map[string]any{
-		"config":   map[string]any{"wide_screen_mode": true},
-		"header":   map[string]any{"title": map[string]any{"tag": "plain_text", "content": markdownTitle(m)}},
-		"elements": elements,
-	}
-	if len(m.Items) > 0 {
-		card["header"].(map[string]any)["template"] = feishuSeverityTemplate(m.Items[0].Severity)
-	}
+	card["elements"] = elements
 	return card, kept
+}
+
+// feishuJSONSize returns the number of bytes v takes in the request body.
+func feishuJSONSize(v any) int {
+	raw, _ := json.Marshal(v)
+	return len(raw)
 }
 
 func feishuMarkdownDiv(content string) map[string]any {
@@ -176,7 +216,7 @@ func feishuButton(label, url string) map[string]any {
 // lark_md 与 markdown 是同族的文本格式，同样会解析链接与强调，所以来自外部
 // 的字段一律过 markdownText（单行化 + 转义）——否则一条漏洞标题就能在
 // 飞书里变成可点击的外链。
-func feishuItemLines(it Item) string {
+func feishuItemLines(it Item, lim Limits) string {
 	out := fmt.Sprintf("**%s · %s**", SeverityLabel(it.Severity), markdownText(it.Title(), 0))
 	if it.IsStatusChange() {
 		out += fmt.Sprintf("\n**Status Change**: %s → %s",
@@ -185,11 +225,11 @@ func feishuItemLines(it Item) string {
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
 		out += fmt.Sprintf("\n**Type**: %s", markdownText(it.VulnClass, 0))
 	}
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		out += fmt.Sprintf("\n**Asset**: %s", markdownText(a, 0))
 	}
 	if it.Summary != "" {
-		if s := markdownText(it.Summary, maxSummaryRunes); s != "" {
+		if s := markdownText(it.Summary, lim.SummaryRunes); s != "" {
 			out += fmt.Sprintf("\n**Summary**: %s", s)
 		}
 	}
@@ -197,9 +237,9 @@ func feishuItemLines(it Item) string {
 }
 
 // feishuBatchLine 渲染汇总卡片里的一条。
-func feishuBatchLine(it Item, index int) string {
+func feishuBatchLine(it Item, index int, lim Limits) string {
 	line := fmt.Sprintf("**%d. %s · %s**", index, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		line += " — " + markdownText(a, 0)
 	}
 	return line

@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/report"
 )
 
 // companyScopeInputs accepts both the new [{kind,value}] contract and the
@@ -387,6 +389,86 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		"total":  total,
 		"assets": assets,
 	})
+}
+
+// =====================================================================
+// GET /api/assets/export
+// =====================================================================
+
+// assetsExport exports assets as CSV or JSON without pagination, mirroring
+// findingsExport. scope=selected requires ids; scope=filtered (default) reuses
+// the full listAssets filter set (type, task_id, company_id, dsl) so the export
+// matches exactly what the user sees; scope=all exports everything.
+func (s *Server) assetsExport(w http.ResponseWriter, r *http.Request) {
+	as := s.assetStore()
+	if as == nil {
+		writeErr(w, 503, "database unavailable")
+		return
+	}
+	q := r.URL.Query()
+	scope := q.Get("scope")
+	format := q.Get("format")
+
+	var ids []int64
+	var filter db.AssetExportFilter
+	switch scope {
+	case "selected":
+		for _, part := range strings.Split(q.Get("ids"), ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(part, 10, 64)
+			if err != nil || id <= 0 {
+				writeErr(w, 400, "bad asset id: "+part)
+				return
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			writeErr(w, 400, "no assets selected")
+			return
+		}
+	case "all":
+		// An empty filter applies no conditions.
+	case "filtered", "":
+		filter.Type = q.Get("type")
+		filter.DSL = q.Get("dsl")
+		if filter.DSL != "" {
+			if err := db.ValidateDSL(filter.DSL); err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		filter.TaskID, _ = strconv.ParseInt(q.Get("task_id"), 10, 64)
+		filter.CompanyID, _ = strconv.ParseInt(q.Get("company_id"), 10, 64)
+		if filter.Type == "" && filter.DSL == "" && filter.CompanyID <= 0 && filter.TaskID <= 0 {
+			filter.Type = "root_domain"
+		}
+	default:
+		writeErr(w, 400, "bad scope: "+scope)
+		return
+	}
+
+	assets, err := as.ListAssetsForExport(filter, ids)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+
+	stamp := time.Now().Format("20060102-150405")
+	setDownload := func(contentType, filename string) {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	}
+	switch format {
+	case "json":
+		setDownload("application/json; charset=utf-8", "assets-"+stamp+".json")
+		_ = json.NewEncoder(w).Encode(assets)
+	default:
+		setDownload("text/csv; charset=utf-8", "assets-"+stamp+".csv")
+		_, _ = w.Write(report.AssetsCSV(assets))
+	}
 }
 
 // =====================================================================

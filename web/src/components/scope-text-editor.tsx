@@ -30,10 +30,17 @@ export function ScopeTextEditor({
 
   const scopeKindLabels: Record<CompanyScopeKind, string> = {
     domain: t("scope.kind.domain"),
+    host: t("companies.scopeKindHost"),
     ip: t("scope.kind.ip"),
     cidr: t("scope.kind.cidr"),
     icp: t("scope.kind.icp"),
     keyword: t("scope.kind.keyword"),
+  };
+
+  // Hover hints explain the breadth difference between domain and host rules.
+  const scopeKindHints: Partial<Record<CompanyScopeKind, string>> = {
+    domain: t("companies.scopeHintDomain"),
+    host: t("companies.scopeHintHost"),
   };
 
   const counts = React.useMemo(() => {
@@ -61,7 +68,12 @@ export function ScopeTextEditor({
           {Object.entries(scopeKindLabels).map(([kind, kindLabel]) => {
             const count = counts.get(kind as CompanyScopeKind) ?? 0;
             return count > 0 ? (
-              <Badge key={kind} variant="secondary" className="font-mono tabular-nums">
+              <Badge
+                key={kind}
+                variant="secondary"
+                className="font-mono tabular-nums"
+                title={scopeKindHints[kind as CompanyScopeKind]}
+              >
                 {kindLabel} {count}
               </Badge>
             ) : null;

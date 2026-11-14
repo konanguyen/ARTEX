@@ -13,10 +13,26 @@ export type ParsedCompanyScopeText = {
   errors: Array<{ line: number; error: string }>;
 };
 
-export const COMPANY_SCOPE_KINDS = new Set<CompanyScopeKind>(["domain", "ip", "cidr", "icp", "keyword"]);
+export const COMPANY_SCOPE_KINDS: Record<CompanyScopeKind, true> = {
+  domain: true,
+  host: true,
+  ip: true,
+  cidr: true,
+  icp: true,
+  keyword: true,
+};
+
+// A textarea line written as `host:<name>` is a `host` rule; every other dotted
+// name is a `domain` rule. Saved host rules are shown with the prefix so they
+// keep their kind when the scope is edited.
+export const HOST_SCOPE_PREFIX = "host:";
+
+export function companyScopeRuleText(rule: CompanyScopeRule): string {
+  return rule.kind === "host" ? `${HOST_SCOPE_PREFIX}${rule.value}` : rule.value;
+}
 
 export function isCompanyScopeKind(value: unknown): value is CompanyScopeKind {
-  return typeof value === "string" && COMPANY_SCOPE_KINDS.has(value as CompanyScopeKind);
+  return typeof value === "string" && Object.hasOwn(COMPANY_SCOPE_KINDS, value);
 }
 
 function isIPv4(value: string): boolean {
@@ -110,7 +126,8 @@ export function companyScopeRuleError(
       max: MAX_COMPANY_SCOPE_VALUE_LENGTH,
     });
   }
-  if (rule.kind === "domain") {
+  // host shares the domain hostname syntax; the kinds differ only in matching breadth.
+  if (rule.kind === "domain" || rule.kind === "host") {
     if (/\s/.test(value)) return tr("assets.scopeError.domainNoSpaces", "请输入不含空格的有效域名或 URL");
     const hostname = domainHostname(value);
     if (!hostname || ipVersion(hostname) !== null)
@@ -163,6 +180,11 @@ export function classifyCompanyScopeLine(
         max: MAX_COMPANY_SCOPE_VALUE_LENGTH,
       }),
     };
+  }
+  if (value.toLowerCase().startsWith(HOST_SCOPE_PREFIX)) {
+    const rule: CompanyScopeRule = { kind: "host", value: value.slice(HOST_SCOPE_PREFIX.length).trim() };
+    const error = companyScopeRuleError(rule, t);
+    return error ? { line, error } : { line, rule };
   }
   if (preservedRule) {
     const rule = { kind: preservedRule.kind, value };
@@ -224,7 +246,7 @@ export function parseCompanyScopeText(
 
 export function normalizeCompanyScopeValue(rule: CompanyScopeRule): string {
   const value = rule.value.trim();
-  if (rule.kind === "domain") return domainHostname(value) ?? value.toLowerCase();
+  if (rule.kind === "domain" || rule.kind === "host") return domainHostname(value) ?? value.toLowerCase();
   if (rule.kind === "icp") return value.toLowerCase().replace(/\s/gu, "");
   if (rule.kind === "keyword") return value.toLowerCase().split(/\s+/u).filter(Boolean).join(" ");
   return value.toLowerCase();

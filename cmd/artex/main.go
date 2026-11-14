@@ -52,7 +52,7 @@ func main() {
 
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
+		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
@@ -112,8 +112,19 @@ func run() int {
 		skillDir = abs
 	}
 	log.Printf("[config] Skill directory: %s", skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
-	scrubSecretEnv()
+	// JWT signing key directory (also holds secret.key, see server.NewManager).
+	keyDir := config.KeyDir()
+	log.Printf("[config] JWT key directory: %s", keyDir)
+	// Proxies whose X-Forwarded-For the login rate limit reads; empty trusts none.
+	trusted, err := server.ParseTrustedProxies(os.Getenv("ARTEX_TRUSTED_PROXIES"))
+	if err != nil {
+		log.Printf("[config] ARTEX_TRUSTED_PROXIES: %v", err)
+		return 1
+	}
+	if len(trusted) > 0 {
+		log.Printf("[config] trusted proxies: %v", trusted)
+	}
+	srv := server.New(ctx, mgr, skillDir, *dataDir, keyDir, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -143,19 +154,6 @@ func run() int {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	return code
-}
-
-// secretEnv lists the credentials read from the environment only at startup:
-// ARTEX_PG_DSN by server.NewManager, the API keys by agent.FromEnv in server.New.
-var secretEnv = []string{"ARTEX_PG_DSN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
-
-// scrubSecretEnv removes secretEnv from the process environment once startup has
-// read it. Child processes (agent shells, custom tools, MCP stdio servers) copy
-// os.Environ() when they are spawned, so they no longer inherit these values.
-func scrubSecretEnv() {
-	for _, k := range secretEnv {
-		_ = os.Unsetenv(k)
-	}
 }
 
 // shutdownContext deliberately does not derive from signalCtx. If it did, the

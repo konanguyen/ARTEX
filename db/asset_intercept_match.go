@@ -44,7 +44,7 @@ func (r AssetInterceptRule) Reason() string {
 
 // matchOne reports whether a single enabled rule matches the given domain/IP/URL candidates,
 // returning the matched value.
-func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) {
+func matchOne(r AssetInterceptRule, domains, ips, urls []string, allow bool) (string, bool) {
 	p := strings.TrimSpace(r.Pattern)
 	if p == "" {
 		return "", false
@@ -69,9 +69,17 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 			}
 		}
 	case "fuzzy_domain":
-		lp := strings.ToLower(p)
+		lp := strings.Trim(strings.ToLower(p), ".")
+		if lp == "" {
+			return "", false
+		}
 		for _, d := range domains {
-			if d != "" && strings.Contains(strings.ToLower(d), lp) {
+			domain := strings.Trim(strings.ToLower(strings.TrimSpace(d)), ".")
+			matched := strings.Contains("."+domain+".", "."+lp+".")
+			if allow {
+				matched = domain == lp || strings.HasSuffix(domain, "."+lp)
+			}
+			if matched {
 				return d, true
 			}
 		}
@@ -118,7 +126,7 @@ func matchAssetInterceptRules(rules []AssetInterceptRule, domains, exactDomains,
 		if allow && r.Kind == "exact_domain" {
 			ruleDomains = exactDomains
 		}
-		if v, ok := matchOne(r, ruleDomains, ips, urls); ok {
+		if v, ok := matchOne(r, ruleDomains, ips, urls, allow); ok {
 			return r, v, true
 		}
 	}

@@ -430,16 +430,16 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 	)
 }
 
-// addTaskScope lets the plan agent add test scope to THE CURRENT TASK — the coverage
-// denominator and the task's authorization edge. Worker discoveries are auto-scoped
-// (precise host) by insertAssets; this tool is for DELIBERATELY WIDENING: pull a whole
-// root domain or whole company into scope, or add a specific subdomain / ip.
+// addTaskScope lets the plan agent record the current task's declared test scope
+// for prompt guidance, asset records, and coverage. Allowed worker discoveries
+// are auto-scoped as precise hosts by insertAssets; explicit additions must stay
+// within the minimum scope requested by the user and pass the asset gate.
 func (t *ToolSet) addTaskScope() actool.CoreTool {
 	return writeTool(
 		"add_task_scope",
-		"把测试范围加入【本任务】——这是本任务的授权边界，也是资产测试覆盖度的分母。\n"+
+		"为本任务添加声明的测试范围：提示词指导和资产记录/覆盖率筛选。它不是网络边界；工具调用仅由 Interception 规则阻止。\n"+
 			"kind 支持：company(整个公司名下资产) / root_domain(整个根域，含所有子域) / subdomain(单个精确子域) / ip / cidr / icp / keyword。\n"+
-			"说明：worker 逐个碰到的主机会被系统【自动】加进范围(精确子域)；本工具用于【主动扩大】——把整个根域/整个公司纳入，或补充指定某子域/IP。\n"+
+			"worker 遇到的允许主机会自动作为精确子域名加入。仅添加用户明确要求的最小范围，绝不自行扩大。\n"+
 			"value：company 传公司名或 id(公司须已存在)；root_domain/subdomain 传域名；ip/cidr 传 IP 或网段；icp/keyword 传备案号或企业关键词。\n"+
 			"务必给 reason 说明依据(可审计)。多条用 entries 数组。",
 		obj(map[string]any{

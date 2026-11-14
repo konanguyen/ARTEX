@@ -8,13 +8,16 @@ import (
 // 本文件是「Markdown 系」渠道（钉钉、企业微信）共用的消息渲染。
 // 飞书用卡片 JSON、Telegram 用 HTML、邮件用 HTML，各自在适配器里渲染。
 
-// maxAssetsShown 是消息里最多列出几个资产。一个漏洞可能锚定几十个资产，
-// 全列会挤爆消息且没有信息价值——第 4 个之后的域名没人会在 IM 里看。
-const maxAssetsShown = 3
+// DefaultMaxAssetsShown is the default maximum number of assets listed in a
+// message (Limits.AssetsShown). A vulnerability can be anchored to dozens of
+// assets; listing them all would blow up the message with no informational
+// value — nobody reads the 4th domain onwards in an IM.
+const DefaultMaxAssetsShown = 3
 
-// maxSummaryRunes 是摘要被压缩到多少字符。IM 消息是「提示去看详情」，
-// 不是报告本体，完整内容在平台里。
-const maxSummaryRunes = 120
+// DefaultMaxSummaryRunes is the default number of characters the summary is
+// compressed to (Limits.SummaryRunes). An IM message is a "go look at the
+// details" hint, not the report itself; the full content lives on the platform.
+const DefaultMaxSummaryRunes = 120
 
 // markdownReservedBytes 预留给消息头部（汇总行 + 级别分布 + 可能的截断提示）
 // 与尾部（平台链接）。按整条打包时把这部分从预算里扣掉，保证头尾不会被截掉——
@@ -95,7 +98,7 @@ func markdownBody(m Message, maxBytes int) (string, int) {
 			return "", 0
 		}
 		var b strings.Builder
-		writeItem(&b, m.Items[0], "", true)
+		writeItem(&b, m.Items[0], "", true, m.limits())
 		// 单条消息即使超长也照发（由最终截断兜底）：一条漏洞的部分信息
 		// 也好过一条都不发。
 		return TruncateBytes(b.String(), maxBytes), 1
@@ -107,7 +110,7 @@ func markdownBody(m Message, maxBytes int) (string, int) {
 	}
 	kept := packItemCount(m.Items, maxBytes, markdownReservedBytes, footer, byteSize, func(it Item, idx int) string {
 		var b strings.Builder
-		writeItem(&b, it, fmt.Sprintf("%d. ", idx+1), false)
+		writeItem(&b, it, fmt.Sprintf("%d. ", idx+1), false, m.limits())
 		return b.String()
 	})
 
@@ -115,7 +118,7 @@ func markdownBody(m Message, maxBytes int) (string, int) {
 	var b strings.Builder
 	b.WriteString(markdownBatchIntro(m, items, len(m.Items)))
 	for i, it := range items {
-		writeItem(&b, it, fmt.Sprintf("%d. ", i+1), false)
+		writeItem(&b, it, fmt.Sprintf("%d. ", i+1), false, m.limits())
 	}
 	b.WriteString(footer)
 	return TruncateBytes(b.String(), maxBytes), kept
@@ -164,12 +167,12 @@ func markdownBatchIntro(m Message, items []Item, total int) string {
 // 所有来自外部的内容（标题/类型/资产/摘要）都过 markdownText：
 // 单行化 + 转义。回链是管理员配置的 public_base_url 拼出来的，不是不可信内容，
 // 且必须是可点的链接，所以原样输出。
-func writeItem(b *strings.Builder, it Item, prefix string, single bool) {
+func writeItem(b *strings.Builder, it Item, prefix string, single bool, lim Limits) {
 	line := fmt.Sprintf("%s**%s · %s**", prefix, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
 	if !single {
 		// 汇总模式：单行呈现，资产与摘要压缩后跟在后面。
 		var extras []string
-		if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+		if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 			extras = append(extras, markdownText(a, 0))
 		}
 		if it.Summary != "" {
@@ -189,11 +192,11 @@ func writeItem(b *strings.Builder, it Item, prefix string, single bool) {
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
 		fmt.Fprintf(b, "**Type**: %s\n", markdownText(it.VulnClass, 0))
 	}
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		fmt.Fprintf(b, "**Asset**: %s\n", markdownText(a, 0))
 	}
 	if it.Summary != "" {
-		if s := markdownText(it.Summary, maxSummaryRunes); s != "" {
+		if s := markdownText(it.Summary, lim.SummaryRunes); s != "" {
 			fmt.Fprintf(b, "**Summary**: %s\n", s)
 		}
 	}

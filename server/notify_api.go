@@ -425,6 +425,8 @@ func (s *Server) notifyTestChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := notifyTestMessage(s.notifierBaseURL(pg))
+	limits := notifyLimits(pg)
+	msg.Limits = &limits
 	start := time.Now()
 	// 测试消息只有一条，送达条数这里不需要（渠道长度上限对单条消息而言
 	// 由截断兜底，不涉及分段）。

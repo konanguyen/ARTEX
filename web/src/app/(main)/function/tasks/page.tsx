@@ -2585,6 +2585,7 @@ function CategoryPicker({
 
 function getCompanyScopeLabel(kind: string, t?: TranslateFn): string {
   if (kind === "domain") return t ? t("tasks.companyScope.domain") : "Domain";
+  if (kind === "host") return t ? t("companies.scopeKindHost") : "Host";
   if (kind === "keyword") return t ? t("tasks.companyScope.keyword") : "Keyword";
   return kind.toUpperCase();
 }

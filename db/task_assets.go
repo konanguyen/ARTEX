@@ -196,6 +196,35 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 			} else {
 				mutation.AssetsLinked++
 			}
+		case "host":
+			// A host rule names exactly one hostname: the task scope `subdomain`
+			// kind, matched on the asset's own domain. An apex host is stored as
+			// its root_domain asset rather than a subdomain row.
+			taskScope.Kind = "subdomain"
+			taskScope.Domain = rule.Domain
+			assetType := "subdomain"
+			if _, isApex := RootDomain(rule.Domain); isApex {
+				assetType = "root_domain"
+			}
+			var alreadyLinked bool
+			err := tx.QueryRow(`SELECT id, $3=ANY(task_ids) FROM assets WHERE type=$1 AND domain=$2`, assetType, rule.Domain, taskID).
+				Scan(&assetID, &alreadyLinked)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return mutation, err
+			}
+			if assetType == "root_domain" {
+				assetID, err = scoped.UpsertRootDomain(UpsertRootDomainReq{Domain: rule.Domain, TaskID: taskID})
+			} else {
+				assetID, err = scoped.UpsertSubdomain(UpsertSubdomainReq{Domain: rule.Domain, TaskID: taskID})
+			}
+			if err != nil {
+				return mutation, err
+			}
+			if alreadyLinked {
+				mutation.AssetsExisting++
+			} else {
+				mutation.AssetsLinked++
+			}
 		case "ip":
 			taskScope.Kind = "ip"
 			taskScope.Net = rule.Net

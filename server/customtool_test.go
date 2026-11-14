@@ -185,3 +185,28 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
 	}
 }
+
+// The proxy URL of the http tool's transport: an address with a scheme is kept
+// as is, a bare host:port gets "http://"; never a doubled scheme.
+func TestHTTPProxyTransportProxyScheme(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://api.example.com/", nil)
+	for _, c := range []struct {
+		name, globalProxy string
+		spec              httpExec
+		want              string
+	}{
+		{"recording proxy, global proxy with a scheme", "http://127.0.0.1:3128", httpExec{UseRecordingProxy: true}, "http://127.0.0.1:3128"},
+		{"operator proxy with a scheme", "", httpExec{Proxy: "http://10.0.0.5:8080"}, "http://10.0.0.5:8080"},
+		{"operator proxy as bare host:port", "", httpExec{Proxy: " 10.0.0.5:8080 "}, "http://10.0.0.5:8080"},
+	} {
+		s := &Server{m: &Manager{globalProxy: c.globalProxy}}
+		tr := s.httpProxyTransport(c.spec)
+		if tr == nil || tr.Proxy == nil {
+			t.Fatalf("%s: transport %+v, want a proxy transport", c.name, tr)
+		}
+		u, err := tr.Proxy(req)
+		if err != nil || u == nil || u.String() != c.want {
+			t.Fatalf("%s: Proxy(req) = %v, %v; want %s", c.name, u, err, c.want)
+		}
+	}
+}

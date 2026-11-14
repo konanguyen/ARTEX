@@ -1,6 +1,11 @@
 package notify
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -97,6 +102,113 @@ func TestFeishuPackingReportsKept(t *testing.T) {
 	}
 }
 
+// TestFeishuDigestBodiesStayWithinCardLimit covers digests of many short items.
+//
+// Every digest line is sent as its own card element, which costs about 52 bytes
+// of JSON around the text plus whatever the encoding escapes. The packing used
+// to count the text only, so a digest of several hundred short lines left as one
+// request of more than twice Feishu's 20 KB limit, and Feishu rejects such a
+// request as a whole.
+//
+// The digest is sent the way the delivery engine does it: the items a message
+// did not hold go into the next one. The bodies measured are the real ones sent
+// on the wire, signature included. No item may be lost on the way: across the
+// messages, every item appears exactly once and in order.
+func TestFeishuDigestBodiesStayWithinCardLimit(t *testing.T) {
+	const total = 500
+
+	short := batchMsg(total)
+	for i := range short.Items {
+		short.Items[i].Assets = nil
+	}
+	// The JSON encoding escapes quotes, angle brackets and ampersands, and the
+	// backslashes the lark_md escaping put in before it: these titles take
+	// several times their length once serialized.
+	escaped := batchMsg(total)
+	for i := range escaped.Items {
+		escaped.Items[i].Name = `<a href="x">R&D</a> vuln` + itoa(i+1)
+	}
+
+	cases := []struct {
+		name   string
+		m      Message
+		prefix string
+	}{
+		{"short lines without assets", short, "漏洞"},
+		{"short lines with one asset", batchMsg(total), "漏洞"},
+		{"lines that grow when serialized", escaped, "vuln"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ = io.ReadAll(r.Body)
+				_, _ = io.WriteString(w, `{"code":0,"msg":"success"}`)
+			}))
+			defer srv.Close()
+			cfg := map[string]any{"webhook": srv.URL, "secret": "SECtest123"}
+
+			m := tc.m
+			seen, messages := 0, 0
+			for len(m.Items) > 0 {
+				kept, err := (feishuChannel{}).Send(context.Background(), cfg, m)
+				if err != nil {
+					t.Fatalf("message %d: delivery failed: %v", messages+1, err)
+				}
+				messages++
+				if len(raw) > feishuMaxCardBytes {
+					t.Fatalf("message %d: request body of %d bytes exceeds the limit of %d (%d of %d items left to send)",
+						messages, len(raw), feishuMaxCardBytes, len(m.Items), total)
+				}
+				var body struct {
+					Card json.RawMessage `json:"card"`
+				}
+				var card struct {
+					Elements []struct {
+						Tag  string `json:"tag"`
+						Text struct {
+							Content string `json:"content"`
+						} `json:"text"`
+					} `json:"elements"`
+				}
+				if err := json.Unmarshal(raw, &body); err != nil {
+					t.Fatalf("message %d: request body is not valid JSON: %v", messages, err)
+				}
+				if err := json.Unmarshal(body.Card, &card); err != nil {
+					t.Fatalf("message %d: card is not valid JSON: %v", messages, err)
+				}
+				// The packing counts what Send adds around the card as a constant.
+				if got := len(raw) - len(body.Card); got != feishuEnvelopeBytes {
+					t.Fatalf("message %d: %d bytes around the card, feishuEnvelopeBytes says %d", messages, got, feishuEnvelopeBytes)
+				}
+				// Element 0 is the intro; the button, when present, is not a div.
+				lines := 0
+				for _, el := range card.Elements[1:] {
+					if el.Tag != "div" {
+						continue
+					}
+					lines++
+					if want := tc.prefix + itoa(seen+lines) + "**"; !strings.Contains(el.Text.Content, want) {
+						t.Fatalf("message %d: line %d should be item %d (%q), got %q", messages, lines, seen+lines, want, el.Text.Content)
+					}
+				}
+				if kept <= 0 || kept != lines {
+					t.Fatalf("message %d: %d items reported as delivered, the body holds %d", messages, kept, lines)
+				}
+				t.Logf("message %d: %d items, %d bytes", messages, kept, len(raw))
+				seen += kept
+				m.Items = m.Items[kept:]
+			}
+			if seen != total {
+				t.Fatalf("%d items went out across %d messages, want %d", seen, messages, total)
+			}
+			if messages < 2 {
+				t.Fatalf("%d items should not fit one message", total)
+			}
+		})
+	}
+}
+
 func TestWebhookAndEmailReportAllItems(t *testing.T) {
 	// 这两个渠道不截断正文，整批都算送达。
 	m := batchMsg(7)
@@ -164,7 +276,7 @@ func TestMarkdownEscapesUntrustedContent(t *testing.T) {
 			m := Message{Items: []Item{tc.item}}
 			// 单条模式的写Item 是三个 markdown 渠道共用的渲染路径。
 			var b strings.Builder
-			writeItem(&b, tc.item, "", true)
+			writeItem(&b, tc.item, "", true, m.limits())
 			got := b.String()
 			for _, want := range tc.must {
 				if !strings.Contains(got, want) {
