@@ -28,7 +28,6 @@ web/next-env.d.ts
 /docs/
 
 # agent-local instructions/state (managed outside version control)
-/AGENTS.md
 /.agent/
 
 # os
